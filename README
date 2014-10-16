@@ -1,0 +1,38 @@
+MFS
+===
+
+Mfs or Mailfs is a linux kernel IMAP file system. It allows to mount an IMAP
+server in a directory and reading mails by reading files.
+
+
+NOTICE
+------
+
+This project is at its early stage, and has only a pedagogic purpose to help me
+learn how fs and networking work inside linux kernel. If you still want to give
+it a shot I strongly recommend to test it in a VM.
+
+
+How to use it
+-------------
+
+As root user:
+	insmod ./mfs.ko
+	mount -tmfs IPADDR /mnt/mail
+
+As normal user:
+	ls /mnt/mail/INBOX
+	cat /mnt/mail/INBOX/12
+
+
+TODO (not in order)
+-------------------
+
+	- Support server disconnection (try to reconnect)
+	- Export mail in an maildir/mbox/understandable format
+	- Implement mail body cache, so not to fetch mail body too often
+	- Support multidirectory imap, so far only INBOX mails are working
+	- Pass user:login as mount options
+	- Support mail deletion when doing a "rm" on it.
+	- Support concurrent file access (protect imap structure)
+	- and so on ...

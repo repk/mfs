@@ -1,0 +1,16 @@
+# We are called from the kernel (this makefile call the kernel's one which
+# call's this one. So if KERNELRELEASE is defined we are at the second called to
+# this makefile
+ifneq ($(KERNELRELEASE),)
+        obj-m := mfs.o
+
+# Here we are at the first call
+else
+        KERNDIR ?= /lib/modules/$(shell uname -r)/build
+        PWD := $(shell pwd)
+
+
+default:
+	$(MAKE) -C $(KERNDIR) M=$(PWD) modules
+
+endif
