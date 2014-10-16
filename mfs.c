@@ -3,11 +3,73 @@
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/pagemap.h> /* (PAGE_CACHE_SIZE, etc) */
+#include <linux/string.h>
+#include <linux/slab.h>
+#include <linux/net.h>
+#include <linux/inet.h>
+#include <linux/in.h>
+#include <linux/netdevice.h>
 
 /**
  * Used by to detect superblocks' filesytem
  */
 #define MFS_MAGIC 0x20141012
+#define MFS_PORT 12112
+
+
+/**
+ * -----------------------------------------------
+ *  TCP session
+ * -----------------------------------------------
+ */
+struct mfs_client {
+	struct socket *cs;
+};
+
+/**
+ * Init tcp session for mfs
+ */
+static int mfs_init_session(struct mfs_client *clt, char const *addr,
+		char *data)
+{
+	struct sockaddr_in sin;
+	struct socket *cs;
+	int err;
+
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = in_aton(addr);
+	sin.sin_port = htons(MFS_PORT);
+
+	/**
+	 * XXX should I use sock_create() instead ?
+	 */
+	err = __sock_create(read_pnet(&current->nsproxy->net_ns), PF_INET,
+			SOCK_STREAM, IPPROTO_TCP, &cs, 1);
+	if(err != 0)
+		return err;
+
+	/**
+	 * XXX use kernel_connect() ???
+	 */
+	err = cs->ops->connect(cs, (struct sockaddr *)&sin, sizeof(sin), 0);
+	if (err < 0) {
+		sock_release(cs);
+		return err;
+	}
+
+	clt->cs = cs;
+
+	return 0;
+}
+
+/**
+ * Close tcp session
+ */
+static void mfs_close_session(struct mfs_client *clt)
+{
+	sock_release(clt->cs);
+}
+
 
 /**
  * -----------------------------------------------
@@ -18,43 +80,58 @@
 
 static int mfs_open(struct inode *inode, struct file *f)
 {
-	f->private_data = inode->i_private;
+	f->private_data = inode->i_sb->s_fs_info;
 	return 0;
 }
 
 static ssize_t mfs_read_file(struct file *f, char __user *buf, size_t size,
                 loff_t *off)
 {
-	char const *str = (char const *)f->private_data;
-	size_t filesz = strlen(f->private_data);
-	size_t len = min(size, filesz);
-	int ret;
-
+	struct mfs_client *clt = (struct mfs_client *)f->private_data;
 	/**
-	 * Nothing to read here
+	 * Struct iovec is for userspace buffers. If it were for kernel space
+	 * buffer, struct kvec would have been used as well as kernel_recvmsg()
+	 * instead of socket_recvmsg.
 	 */
-	if(*off >= filesz)
-		return 0;
+	struct iovec iov = {
+		.iov_base = buf,
+		.iov_len = size,
+	};
+	struct msghdr msg = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
 
+	return sock_recvmsg(clt->cs, &msg, size, 0);
+}
+
+static ssize_t mfs_write_file(struct file *f, const char __user *buf,
+		size_t size, loff_t *off)
+{
+	struct mfs_client *clt = (struct mfs_client *)f->private_data;
 	/**
-	 * Fill user buffer
+	 * Struct iovec is for userspace buffers. If it were for kernel space
+	 * buffer, struct kvec would have been used as well as kernel_sendmsg()
+	 * instead of socket_sendmsg.
 	 */
-	ret = copy_to_user(buf, str + *off, len);
-	if(ret)
-		return -EINVAL;
+	struct iovec iov = {
+		.iov_base = (void __user *)buf,
+		.iov_len = size,
+	};
+	struct msghdr msg = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
 
-	/**
-	 * Forward the file read offset
-	 */
-	*off += len;
-
-	return len;
+	return sock_sendmsg(clt->cs, &msg, size);
 }
 
 static struct file_operations mfs_file_ops = {
 	.open	= mfs_open,
 	.read	= mfs_read_file,
+	.write	= mfs_write_file,
 };
+
 
 /**
  * -----------------------------------------------
@@ -87,7 +164,7 @@ out:
  * Create a single read only file
  */
 static void mfs_create_file(struct super_block *sb, struct dentry *parent,
-		char const * name, char * data)
+		char const * name, void * data)
 {
 	struct dentry *dentry;
 	struct inode *inode;
@@ -112,7 +189,6 @@ static void mfs_create_file(struct super_block *sb, struct dentry *parent,
 		goto out;
 
 	inode->i_fop = &mfs_file_ops;
-	inode->i_private = data;
 
 	/**
 	 * Put file in the tree
@@ -123,6 +199,11 @@ out:
 	return;
 }
 
+static void mfs_create_netfile(struct super_block *sb, struct dentry *parent)
+{
+	mfs_create_file(sb, parent, "net", sb->s_fs_info);
+}
+
 /**
  * Populate root with static file tree
  */
@@ -131,7 +212,7 @@ static void mfs_populate(struct super_block *sb, struct dentry *root)
 	/**
 	 * For now create only one file
 	 */
-	mfs_create_file(sb, root, "hey", "Hey dude where is my car\n");
+	mfs_create_netfile(sb, root);
 }
 
 /**
@@ -158,7 +239,7 @@ static struct super_operations mfs_ops = {
 /**
  * Fill a superblock
  */
-static int mfs_fill_super(struct super_block *sb, void *data, int silent)
+static int mfs_fill_super(struct super_block *sb, int flags, void *data)
 {
 	struct inode *root;
 	struct dentry *rdentry;
@@ -200,6 +281,7 @@ err:
 	return -ENOMEM;
 }
 
+
 /**
  * -----------------------------------------------
  *  File system type
@@ -207,12 +289,67 @@ err:
  */
 
 /**
+ * TODO: Doc understand what this does
+ */
+static int mfs_set_super(struct super_block *s, void *data)
+{
+	s->s_fs_info = data;
+	return set_anon_super(s, data);
+}
+
+/**
  * Called by vfs when mount syscall has been raised
  */
 static struct dentry *mfs_mount(struct file_system_type *fst, int flags,
-		const char *devname, void *data)
+		const char *dev_name, void *data)
 {
-	return mount_nodev(fst, flags, data, mfs_fill_super);
+	struct mfs_client *clt;
+	struct super_block *sb = NULL;
+	int err;
+
+	clt = kzalloc(sizeof(*clt), GFP_KERNEL);
+	if (clt == NULL) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	err = mfs_init_session(clt, dev_name, data);
+	if (err != 0)
+		goto free_client;
+
+	sb = sget(fst, NULL, mfs_set_super, flags, clt);
+
+	if (IS_ERR(sb)) {
+		err = PTR_ERR(sb);
+		goto close_sess;
+	}
+
+	err = mfs_fill_super(sb, flags, data);
+	if(err != 0)
+		goto release_sb;
+
+	return dget(sb->s_root);
+
+release_sb:
+	deactivate_locked_super(sb);
+close_sess:
+	mfs_close_session(clt);
+free_client:
+	kfree(clt);
+error:
+	return ERR_PTR(err);
+}
+
+/**
+ * Called by vfs to kill super block (umount)
+ */
+static void mfs_kill_super(struct super_block *s)
+{
+	struct mfs_client *clt = (struct mfs_client *)s->s_fs_info;
+
+	kill_litter_super(s);
+	mfs_close_session(clt);
+	kfree(clt);
 }
 
 /**
@@ -223,7 +360,7 @@ static struct file_system_type mfstype = {
 	.owner = THIS_MODULE,
 	.name = "mfs",
 	.mount = mfs_mount,
-	.kill_sb = kill_litter_super,
+	.kill_sb = mfs_kill_super,
 };
 
 
