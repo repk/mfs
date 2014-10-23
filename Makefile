@@ -22,4 +22,10 @@ default: build $(SRC) Makefile
 build:
 	mkdir -p build
 
+clean:
+	rm -f $(KOBJ:%=$(KBUILD)/%)
+
+distclean:
+	rm -rf $(KBUILD)
+
 endif
