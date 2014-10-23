@@ -1,4 +1,5 @@
-SRC := vmfs.c
+SRC := mfs_client.c mfs_file.c mfs_inode.c mfs_super.c mfs_mod.c
+INC := mfs_client.h mfs_file.h mfs_inode.h mfs_super.h
 KBUILD := build
 KOBJ := $(SRC:%.c=%.o)
 
@@ -15,7 +16,7 @@ KERNDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
 default: build $(SRC) Makefile
-	cp $(SRC) Makefile $(KBUILD)/
+	cp $(SRC) Makefile $(INC) $(KBUILD)/
 	$(MAKE) -C $(KERNDIR) M=$(PWD)/$(KBUILD) modules
 	rm $(SRC:%=$(KBUILD)/%) $(KBUILD)/Makefile
 
