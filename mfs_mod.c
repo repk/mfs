@@ -33,17 +33,19 @@ static struct dentry *mfs_mod_mount(struct file_system_type *fst, int flags,
 		goto error;
 	}
 
-	err = mfs_client_init_session(clt, dev_name, data);
-	if(err != 0)
-		goto free_client;
-
 	sb = sget(fst, NULL, mfs_super_set, flags, clt);
 	if(IS_ERR(sb)) {
 		err = PTR_ERR(sb);
-		goto close_sess;
+		goto free_client;
 	}
 
 	err = mfs_super_fill(sb, flags, data);
+	if(err != 0)
+		goto release_sb;
+
+	mfs_client_set_sb(clt, sb);
+
+	err = mfs_client_init_session(clt, dev_name, data);
 	if(err != 0)
 		goto release_sb;
 
@@ -54,8 +56,6 @@ static struct dentry *mfs_mod_mount(struct file_system_type *fst, int flags,
 
 release_sb:
 	deactivate_locked_super(sb);
-close_sess:
-	mfs_client_close_session(clt);
 free_client:
 	kfree(clt);
 error:

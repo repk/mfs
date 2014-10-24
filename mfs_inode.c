@@ -1,6 +1,7 @@
 #include <linux/fs.h>
 
 #include "mfs_inode.h"
+#include "mfs_dir.h"
 #include "mfs_file.h"
 
 /**
@@ -32,9 +33,9 @@ out:
 }
 
 /**
- * Create a new file
+ * Create a new directory
  */
-static void mfs_inode_create_file(struct super_block *sb,
+struct dentry *mfs_inode_create_dir(struct super_block *sb,
 		struct dentry *parent, char const *name, void *data)
 {
 	struct dentry *dentry;
@@ -53,11 +54,52 @@ static void mfs_inode_create_file(struct super_block *sb,
 	 */
 	dentry = d_alloc(parent, &qname);
 	if(dentry == NULL)
-		goto out;
+		goto err;
+
+	inode = mfs_inode_make(sb, S_IFDIR | 0544);
+	if(inode == NULL)
+		goto err;
+
+	inode->i_op = &mfs_dir_inode_ops;
+	inode->i_fop = &mfs_dir_ops;
+
+	/**
+	 * Associate the file and its dentry
+	 */
+	d_add(dentry, inode);
+
+	return dentry;
+err:
+	return NULL;
+}
+
+/**
+ * Create a new file
+ */
+struct dentry *mfs_inode_create_file(struct super_block *sb,
+		struct dentry *parent, char const *name, void *data)
+{
+	struct dentry *dentry;
+	struct inode *inode;
+	struct qstr qname;
+
+	/**
+	 * Make new file dentry name hash
+	 */
+	qname.name = name;
+	qname.len = strlen(name);
+	qname.hash = full_name_hash(name, qname.len);
+
+	/**
+	 * Now create a dentry and inode
+	 */
+	dentry = d_alloc(parent, &qname);
+	if(dentry == NULL)
+		goto err;
 
 	inode = mfs_inode_make(sb, S_IFREG | 0644);
 	if(inode == NULL)
-		goto out;
+		goto err;
 
 	inode->i_fop = &mfs_file_ops;
 
@@ -66,8 +108,9 @@ static void mfs_inode_create_file(struct super_block *sb,
 	 */
 	d_add(dentry, inode);
 
-out:
-	return;
+	return dentry;
+err:
+	return NULL;
 }
 
 /**

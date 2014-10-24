@@ -4,8 +4,9 @@
 #include <linux/netdevice.h>
 
 #include "mfs_client.h"
+#include "mfs_imap.h"
 
-#define MFS_PORT 12112
+#define MFS_PORT 143
 
 /**
  * -------------------------------------
@@ -34,17 +35,25 @@ int mfs_client_init_session(struct mfs_client *clt, char const *addr,
 	err = __sock_create(read_pnet(&current->nsproxy->net_ns), PF_INET,
 			SOCK_STREAM, IPPROTO_TCP, &cs, 1);
 	if(err != 0)
-		return err;
+		goto err;
 
-	err = cs->ops->connect(cs, (struct sockaddr *)&sin, sizeof(sin), 0);	
-	if(err < 0) {
-		sock_release(cs);
-		return err;
-	}
+	err = cs->ops->connect(cs, (struct sockaddr *)&sin, sizeof(sin), 0);
+	if(err < 0)
+		goto sockrelease;
 
 	clt->cs = cs;
+	clt->ops = &imapops;
+
+	err = clt->ops->connect(clt);
+	if(err < 0)
+		goto sockrelease;
 
 	return 0;
+
+sockrelease:
+	sock_release(cs);
+err:
+	return err;
 }
 
 /**
@@ -52,7 +61,16 @@ int mfs_client_init_session(struct mfs_client *clt, char const *addr,
  */
 void mfs_client_close_session(struct mfs_client *clt)
 {
+	clt->ops->close(clt);
 	sock_release(clt->cs);
+}
+
+/**
+ * Associate a superblock with client
+ */
+void mfs_client_set_sb(struct mfs_client *clt, struct super_block *sb)
+{
+	clt->sb = sb;
 }
 
 /**
@@ -79,6 +97,21 @@ ssize_t mfs_client_read(struct mfs_client *clt, char __user *buf, size_t size)
 }
 
 /**
+ * Receive a network message through session
+ * XXX For kernel space buffer
+ */
+ssize_t mfs_client_kernel_read(struct mfs_client *clt, char *buf, size_t size)
+{
+	struct msghdr msg = {};
+	struct kvec iov = {
+		.iov_base = buf,
+		.iov_len = size,
+	};
+
+	return kernel_recvmsg(clt->cs, &msg, &iov, 1, size, 0);
+}
+
+/**
  * Send a message through client session
  * XXX For userspace buffer
  */
@@ -100,4 +133,20 @@ ssize_t mfs_client_write(struct mfs_client *clt, const char __user *buf,
 	};
 
 	return sock_sendmsg(clt->cs, &msg, size);
+}
+
+/**
+ * Send a message through client session
+ * XXX For kernelspace buffer
+ */
+ssize_t mfs_client_kernel_write(struct mfs_client *clt, const char *buf,
+		size_t size)
+{
+	struct msghdr msg = {};
+	struct kvec iov = {
+		.iov_base = (void *)buf,
+		.iov_len = size,
+	};
+
+	return kernel_sendmsg(clt->cs, &msg, &iov, 1, size);
 }
