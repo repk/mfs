@@ -43,7 +43,7 @@ struct imap_msg {
 /**
  * Transform received message into structured imap message
  */
-struct imap_msg *mfs_imap_parse_msg(char const *msg, size_t len);
+struct imap_msg *mfs_imap_parse_msg(char const **msg, size_t *len);
 /**
  * Get a reference on imap msg
  *

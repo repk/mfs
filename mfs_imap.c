@@ -5,6 +5,7 @@
 #include <linux/kthread.h>
 #include <linux/fs.h>
 #include <linux/err.h>
+#include <linux/uaccess.h>
 
 #include "mfs_client.h"
 #include "mfs_inode.h"
@@ -33,6 +34,11 @@
 #define NAME "test"
 #define PASS "test"
 
+enum mfs_imap_f_type {
+	MFS_IMAP_F_UNKNOWN,
+	MFS_IMAP_F_MAIL,
+};
+
 struct imap_cmd {
 	char *str;
 	ssize_t len;
@@ -44,6 +50,7 @@ enum imap_cmd_id {
 	IMAPCMD_LIST,
 	IMAPCMD_SELECT,
 	IMAPCMD_FETCHALL,
+	IMAPCMD_FETCHMAIL,
 	IMAPCMD_NR
 };
 
@@ -55,6 +62,7 @@ static char const * cmdfmt[] = {
 	IMAPCMD_TAG(IMAPCMD_LIST, "LIST \"\" \"*\""),
 	IMAPCMD_TAG(IMAPCMD_SELECT, "SELECT %s"),
 	IMAPCMD_TAG(IMAPCMD_FETCHALL, "UID FETCH 1:* FLAGS"),
+	IMAPCMD_TAG(IMAPCMD_FETCHMAIL, "UID FETCH %s BODY[]"),
 };
 
 struct msgcache {
@@ -63,11 +71,17 @@ struct msgcache {
 	char body[];
 };
 
+struct msgdesc {
+	enum mfs_imap_f_type ftype;
+};
+
 struct message {
-	struct list_head next;
+	struct msgdesc msgd;
+	struct list_head cache_next;
+	struct list_head fetch_next;
 	struct msgcache *mfetch;
-	unsigned int uid;
 	unsigned int flags;
+	char uid[];
 };
 
 struct box {
@@ -88,6 +102,8 @@ struct imap {
 	struct task_struct *thread;
 	struct imap_rcv_handle rcv_handle[MAXTAG];
 	struct list_head boxes;
+	struct list_head fetching;
+	struct box *selbox;
 	wait_queue_head_t rcvwait;
 	size_t mcachesz;
 	atomic_t next_tag;
@@ -97,6 +113,45 @@ struct imap {
 
 #define IMAP_CONN (1 << 0)
 #define IMAP_AUTH (1 << 1)
+
+static inline struct msgcache *imap_new_msgcache(char const *data)
+{
+	struct msgcache *mc;
+
+	mc = kmalloc(sizeof(*mc) + strlen(data) + 1, GFP_KERNEL);
+	if(mc == NULL)
+		return NULL;
+
+	strcpy(mc->body, data);
+	mc->len = strlen(data);
+
+	return mc;
+}
+
+static inline void imap_del_msgcache(struct msgcache *mc)
+{
+	kfree(mc);
+}
+
+static inline struct message *imap_new_msg(char const *uid)
+{
+	struct message *m;
+
+	m = kmalloc(sizeof(*m) + strlen(uid) + 1, GFP_KERNEL);
+
+	if(m == NULL)
+		return m;
+
+	m->msgd.ftype = MFS_IMAP_F_MAIL;
+	strcpy(m->uid, uid);
+
+	return m;
+}
+
+static inline void imap_del_msg(struct message *m)
+{
+	kfree(m);
+}
 
 static struct imap_cmd *imap_create_cmd(struct imap *i,
 		enum imap_cmd_id id, ...)
@@ -172,6 +227,7 @@ static inline struct imap *mfs_imap_alloc(ssize_t mcachesz)
 		i->mcachesz = mcachesz;
 		init_waitqueue_head(&i->rcvwait);
 		INIT_LIST_HEAD(&i->boxes);
+		INIT_LIST_HEAD(&i->fetching);
 	}
 
 	return i;
@@ -220,9 +276,17 @@ static int imap_add_box(struct mfs_client *clt, char const *name)
 
 static int imap_add_mail(struct mfs_client *clt, char const *name)
 {
-	/**
-	 * Next STEP do this TODO
-	 */
+	struct imap *i = (struct imap *)clt->private_data;
+	struct message *m;
+
+	if(i->selbox == NULL)
+		return -1;
+
+	m = imap_new_msg(name);
+	if(m == NULL)
+		return -1;
+
+	mfs_inode_create_file(clt->sb, i->selbox->dir, name, &m->msgd);
 	return 0;
 }
 
@@ -248,11 +312,32 @@ static int imap_rcv_box(struct mfs_client *clt, struct imap_msg *m)
 	return 0;
 }
 
+static inline int imap_fetch_body(struct mfs_client *clt, char const *name,
+		char const *data)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+	struct message *m;
+
+	list_for_each_entry(m, &i->fetching, fetch_next) {
+		if(strcmp(m->uid, name) == 0)
+			break;
+	}
+
+	if(strcmp(m->uid, name) != 0)
+		return -1;
+
+	m->mfetch = imap_new_msgcache(data);
+	if(m->mfetch == NULL)
+		return -1;
+
+	return 0;
+}
+
 static int imap_rcv_mail(struct mfs_client *clt, struct imap_msg *m)
 {
 	struct imap_elt *r = NULL, *p, *e;
 	char name[32];
-	int ret, uid = 0;
+	int ret, uid = 0, fetch = 0;
 
 	e = list_last_entry(&m->elt, struct imap_elt, next);
 	if(e->type != IET_LIST) {
@@ -278,10 +363,37 @@ static int imap_rcv_mail(struct mfs_client *clt, struct imap_msg *m)
 	snprintf(name, 31, "%u", *IMAP_ELT_NUM(r));
 	name[31] = '\0';
 
-	ret = imap_add_mail(clt, name);
-	if(ret != 0) {
-		IMAP_DBG("Failed to fetch message %s\n", name);
-		return 0;
+	list_for_each_entry(p, &r->next, next) {
+		if(fetch) {
+			r = p;
+			break;
+		} else if((p->type == IET_ATOM) &&
+				(strcmp(IMAP_ELT_ATOM(p), "BODY[]") == 0)) {
+			fetch = 1;
+		}
+	}
+
+	/**
+	 * If fetching body do fetch else add mail in filesystem
+	 */
+
+	if(!fetch) {
+		ret = imap_add_mail(clt, name);
+		if(ret != 0) {
+			IMAP_DBG("Failed to fetch message %s\n", name);
+			return 0;
+		}
+	} else {
+		if(r == NULL || r->type != IET_STRING) {
+			IMAP_DBG("Malformed fetch message 2\n");
+			return 0;
+		}
+		ret = imap_fetch_body(clt, name, IMAP_ELT_STR(r));
+		if(ret != 0) {
+			IMAP_DBG("Cannot fetch body for message %s\n", name);
+			return 0;
+		}
+		IMAP_DBG("Fetched msg body");
 	}
 
 	IMAP_DBG("Message fetched %s\n", name);
@@ -361,7 +473,6 @@ static inline int imap_process_msg(struct mfs_client *clt, struct imap_msg *msg)
 		}
 	}
 
-
 	if(!(i->flags & IMAP_CONN)) {
 		i->flags |= IMAP_CONN;
 		/**
@@ -377,8 +488,9 @@ static int imap_receive(void *data)
 {
 	struct imap_msg *im;
 	struct mfs_client *clt = (struct mfs_client *)data;
-	char *buf, *p, *nxt;
-	size_t len, msglen;
+	char *buf;
+	char const *p;
+	size_t len;
 
 	buf = kmalloc(2048 * sizeof(*buf), GFP_KERNEL);
 	if(buf == NULL) {
@@ -387,7 +499,7 @@ static int imap_receive(void *data)
 	}
 
 	while(!kthread_should_stop()) {
-		len = mfs_client_kernel_read(clt, buf, 2047);
+		len = mfs_client_kernel_net_recv(clt, buf, 2047);
 		/**
 		 * XXX should lock imap
 		 */
@@ -400,21 +512,7 @@ static int imap_receive(void *data)
 		 * Iterate over all received messages
 		 */
 		p = buf;
-		while((nxt = strstr(p, "\r\n")) != NULL) {
-			msglen = nxt - p + 2;
-			if(len < msglen) {
-				pr_err("[MFS/IMAP] Bugged command parsing\n");
-				continue;
-			}
-
-			im = mfs_imap_parse_msg(p, msglen);
-			len -= msglen;
-			p = nxt + 2;
-			if(IS_ERR_OR_NULL(im)) {
-				IMAP_DBG("Invalid imap msg");
-				continue;
-			}
-
+		while(!IS_ERR_OR_NULL((im = mfs_imap_parse_msg(&p, &len)))) {
 			imap_process_msg(clt, im);
 			mfs_imap_msg_put(im);
 		}
@@ -430,7 +528,7 @@ static inline int __mfs_imap_send_cmd(struct mfs_client *clt,
 {
 	size_t ret;
 
-	ret = mfs_client_kernel_write(clt, c->str, c->len);
+	ret = mfs_client_kernel_net_send(clt, c->str, c->len);
 	if(ret < 0)
 		return ret;
 
@@ -510,6 +608,53 @@ release:
 	atomic_xchg(&h->ready, 0);
 	atomic_xchg(&h->reserved, 0);
 	return ret;
+}
+
+static int imap_get_msg_body(struct mfs_client *clt, struct message *msg)
+{
+	struct imap_cmd *c;
+	struct imap_msg *r;
+	struct imap_elt *e;
+	struct imap *i = (struct imap *)clt->private_data;
+	int ret;
+
+	c = imap_create_cmd(i, IMAPCMD_FETCHMAIL, msg->uid);
+	if(IS_ERR(c))
+		return PTR_ERR(c);
+
+	list_add_tail(&msg->fetch_next, &i->fetching);
+
+	ret = imap_send_cmd(clt, c, &r);
+
+	imap_cleanup_cmd(c);
+	list_del(&msg->fetch_next);
+
+	if(ret < 0)
+		goto out;
+
+	list_for_each_entry(e, &r->elt, next) {
+		if(!IMAP_ELT_ATOM(e))
+			continue;
+		ret = strcmp(IMAP_ELT_ATOM(e), "OK");
+		if(ret == 0)
+			break;
+	}
+
+	mfs_imap_msg_put(r);
+
+	if(ret > 0 || ret < 0) {
+		IMAP_DBG("Failed to fetch mail\n");
+		return -EINVAL;
+	}
+
+out:
+	return ret;
+}
+
+static int imap_put_msg_body(struct message *msg)
+{
+	imap_del_msgcache(msg->mfetch);
+	return 0;
 }
 
 static inline int mfs_imap_login(struct mfs_client *clt)
@@ -596,7 +741,16 @@ static inline int mfs_imap_select_inbox(struct mfs_client *clt)
 	struct imap_cmd *c;
 	struct imap_elt *e;
 	struct imap_msg *r;
+	struct box *b;
 	int ret;
+
+	list_for_each_entry(b, &i->boxes, next) {
+		if(strcmp("INBOX", b->name) == 0)
+			break;
+	}
+
+	if(strcmp("INBOX", b->name) != 0)
+		return -EINVAL;
 
 	c = imap_create_cmd(i, IMAPCMD_SELECT, "INBOX");
 	if(IS_ERR(c))
@@ -624,6 +778,7 @@ static inline int mfs_imap_select_inbox(struct mfs_client *clt)
 		return -EINVAL;
 	}
 
+	i->selbox = b;
 	IMAP_DBG("inbox selected\n");
 
 out:
@@ -724,7 +879,7 @@ static void mfs_imap_close(struct mfs_client *clt)
 	if(IS_ERR(c))
 		goto ifree;
 
-	mfs_client_kernel_write(clt, c->str, c->len);
+	mfs_client_kernel_net_send(clt, c->str, c->len);
 	imap_cleanup_cmd(c);
 
 	mfs_imap_kill_thread(i);
@@ -732,7 +887,53 @@ ifree:
 	MFS_IMAP_FREE(clt->private_data);
 }
 
+static ssize_t mfs_imap_read(struct mfs_client *clt, struct file *f,
+		void *pdata, char __user *buf, size_t size, loff_t off)
+{
+	struct msgdesc *md = (struct msgdesc *)pdata;
+	struct message *msg;
+	ssize_t ret = -EINVAL;
+	size_t len;
+
+	/**
+	 * XXX Need to lock imap
+	 */
+	switch(md->ftype) {
+	case MFS_IMAP_F_MAIL:
+		msg = container_of(md, struct message, msgd);
+
+		ret = imap_get_msg_body(clt, msg);
+		if(ret != 0)
+			break;
+
+		if(off >= msg->mfetch->len) {
+			ret = 0;
+			break;
+		}
+
+		len = min(size, (size_t)(msg->mfetch->len - off));
+		ret = copy_to_user(buf, msg->mfetch->body + off, len);
+		if(ret == 0)
+			ret = len;
+		imap_put_msg_body(msg);
+		break;
+	default:
+		IMAP_DBG("Invalid imap file type");
+		break;
+	}
+
+	return ret;
+}
+
+static ssize_t mfs_imap_write(struct mfs_client *clt, struct file *f,
+		void *pdata, const char __user *buf, size_t size)
+{
+	return -EINVAL;
+}
+
 struct mfs_client_operations imapops = {
 	.connect = mfs_imap_connect,
 	.close = mfs_imap_close,
+	.read = mfs_imap_read,
+	.write = mfs_imap_write,
 };

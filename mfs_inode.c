@@ -102,6 +102,7 @@ struct dentry *mfs_inode_create_file(struct super_block *sb,
 		goto err;
 
 	inode->i_fop = &mfs_file_ops;
+	inode->i_private = data;
 
 	/**
 	 * Associate the file and its dentry

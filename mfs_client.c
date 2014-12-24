@@ -77,7 +77,8 @@ void mfs_client_set_sb(struct mfs_client *clt, struct super_block *sb)
  * Receive a network message through session
  * XXX For userspace buffer
  */
-ssize_t mfs_client_read(struct mfs_client *clt, char __user *buf, size_t size)
+ssize_t mfs_client_net_recv(struct mfs_client *clt, char __user *buf,
+		size_t size)
 {
 	/**
 	 * Struct iovec is for userspace buffers. If it were for kernel space
@@ -100,7 +101,8 @@ ssize_t mfs_client_read(struct mfs_client *clt, char __user *buf, size_t size)
  * Receive a network message through session
  * XXX For kernel space buffer
  */
-ssize_t mfs_client_kernel_read(struct mfs_client *clt, char *buf, size_t size)
+ssize_t mfs_client_kernel_net_recv(struct mfs_client *clt, char *buf,
+		size_t size)
 {
 	struct msghdr msg = {};
 	struct kvec iov = {
@@ -112,10 +114,24 @@ ssize_t mfs_client_kernel_read(struct mfs_client *clt, char *buf, size_t size)
 }
 
 /**
+ * Generic function called to read from a file
+ */
+ssize_t mfs_client_read(struct mfs_client *clt, struct file *f,
+		char __user *buf, size_t size, loff_t off)
+{
+	struct inode *i = file_inode(f);
+	if(i->i_private == NULL)
+		return mfs_client_net_recv(clt, buf, size);
+
+	return clt->ops->read(clt, f, i->i_private, buf, size, off);
+}
+
+
+/**
  * Send a message through client session
  * XXX For userspace buffer
  */
-ssize_t mfs_client_write(struct mfs_client *clt, const char __user *buf,
+ssize_t mfs_client_net_send(struct mfs_client *clt, const char __user *buf,
 		size_t size)
 {
 	/**
@@ -139,7 +155,7 @@ ssize_t mfs_client_write(struct mfs_client *clt, const char __user *buf,
  * Send a message through client session
  * XXX For kernelspace buffer
  */
-ssize_t mfs_client_kernel_write(struct mfs_client *clt, const char *buf,
+ssize_t mfs_client_kernel_net_send(struct mfs_client *clt, const char *buf,
 		size_t size)
 {
 	struct msghdr msg = {};
@@ -149,4 +165,18 @@ ssize_t mfs_client_kernel_write(struct mfs_client *clt, const char *buf,
 	};
 
 	return kernel_sendmsg(clt->cs, &msg, &iov, 1, size);
+}
+
+/**
+ * Generic function called to write into a file
+ */
+ssize_t mfs_client_write(struct mfs_client *clt, struct file *f,
+		const char __user *buf, size_t size)
+{
+	struct inode *i = file_inode(f);
+
+	if(i->i_private != NULL)
+		return mfs_client_net_send(clt, buf, size);
+
+	return clt->ops->write(clt, f, i->i_private, buf, size);
 }
