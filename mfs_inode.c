@@ -22,6 +22,7 @@ struct inode *mfs_inode_make(struct super_block *sb, int mode)
 	if(ret == NULL)
 		goto out;
 
+	ret->i_ino = get_next_ino();
 	ret->i_mode = mode;
 	ret->i_blocks = 0;
 	ret->i_atime = CURRENT_TIME;
@@ -99,7 +100,7 @@ struct dentry *mfs_inode_create_file(struct super_block *sb,
 
 	inode = mfs_inode_make(sb, S_IFREG | 0644);
 	if(inode == NULL)
-		goto err;
+		goto deldentry;
 
 	inode->i_fop = &mfs_file_ops;
 	inode->i_private = data;
@@ -110,8 +111,41 @@ struct dentry *mfs_inode_create_file(struct super_block *sb,
 	d_add(dentry, inode);
 
 	return dentry;
+deldentry:
+	dput(dentry);
 err:
 	return NULL;
+}
+
+struct dentry * mfs_inode_get(struct super_block *sb, struct dentry *parent,
+	char const *name)
+{
+	struct qstr qname;
+
+
+	/**
+	 * Find our dentry
+	 */
+	qname.name = name;
+	qname.len = strlen(name);
+	qname.hash = full_name_hash(name, qname.len);
+
+	return d_lookup(parent, &qname);
+}
+
+void mfs_inode_put(struct dentry *d)
+{
+	dput(d);
+}
+
+int mfs_inode_delete_file(struct super_block *sb, struct dentry *parent,
+		struct dentry *file)
+{
+
+	simple_unlink(parent->d_inode, file);
+	d_delete(file);
+
+	return 0;
 }
 
 /**
