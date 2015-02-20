@@ -10,9 +10,10 @@
 
 #include "mfs_client.h"
 #include "mfs_inode.h"
-#include "mfs_imap.h"
-#include "mfs_imap_parse.h"
 #include "mfs_cmdqueue.h"
+#include "mfs_imap.h"
+#include "mfs_imap_send.h"
+#include "mfs_imap_parse.h"
 
 #define DEBUG
 
@@ -22,13 +23,6 @@
 #define IMAP_DBG(...) pr_err("[MFS/IMAP]: " __VA_ARGS__)
 #endif
 
-#define XSTR(a) #a
-#define STR(a) XSTR(a)
-
-#define MAXTAG 63
-#define IDLETAG 63
-#define NRTAG 64
-
 /**
  * Keep enough space for 3 digits tag
  */
@@ -37,37 +31,12 @@
 #define MSGCACHESZ 128
 #define BODYMAXLEN (1 << 16)
 
-#define IMAP_TIMEOUT (msecs_to_jiffies(30000))
-#define IMAP_IDLE_TIMEOUT (msecs_to_jiffies(28000 * 60)) /* 28 minutes */
-
 #define NAME "test"
 #define PASS "test"
 
 enum mfs_imap_f_type {
 	MFS_IMAP_F_UNKNOWN,
 	MFS_IMAP_F_MAIL,
-};
-
-enum imap_cmd_id {
-	IMAPCMD_LOGIN,
-	IMAPCMD_LOGOUT,
-	IMAPCMD_LIST,
-	IMAPCMD_SELECT,
-	IMAPCMD_FETCHALL,
-	IMAPCMD_FETCHFROM,
-	IMAPCMD_FETCHMAIL,
-	IMAPCMD_IDLE,
-	IMAPCMD_DONE,
-	IMAPCMD_NR
-};
-
-struct imap_cmd {
-	struct list_head next;
-	struct kref refcnt;
-	char *str;
-	ssize_t len;
-	enum imap_cmd_id id;
-	uint8_t cont;
 };
 
 #define IMAPCMD_TAG(id, s) [id] = {					\
@@ -127,37 +96,6 @@ struct box {
 	off_t sidlast;
 	char name[];
 };
-
-struct imap_rcv_handle {
-	struct imap_msg **rcv;
-	wait_queue_head_t qwait;
-	atomic_t reserved;
-	atomic_t ready;
-};
-
-struct imap {
-	struct task_struct *rcv_thread;
-	struct task_struct *snd_thread;
-	struct task_struct *idl_thread;
-	struct mfs_cmdqueue send;
-	struct imap_rcv_handle rcv_handle[NRTAG];
-	struct list_head boxes;
-	struct list_head fetching;
-	struct box *selbox;
-	wait_queue_head_t rcvwait;
-	wait_queue_head_t idlwait;
-	size_t mcachesz;
-	atomic_t next_tag;
-	atomic_t ctag;
-	atomic_t idling;
-	unsigned int flags;
-	struct msgcache *mcache[];
-};
-
-#define IMAP_CONN (1 << 0)
-#define IMAP_AUTH (1 << 1)
-#define IMAP_INIT (1 << 2)
-#define IMAP_EXIT (1 << 3)
 
 static inline struct msgcache *imap_new_msgcache(char const *data)
 {
@@ -256,7 +194,7 @@ static void imap_del_cmd(struct kref *kref)
 	kfree(c);
 }
 
-static void imap_cleanup_cmd(struct imap_cmd *c)
+void imap_cleanup_cmd(struct imap_cmd *c)
 {
 	kref_put(&c->refcnt, imap_del_cmd);
 }
@@ -398,341 +336,6 @@ static int imap_rm_mail(struct mfs_client *clt, char const *name)
 	return 0;
 }
 
-static inline int __mfs_imap_send_cmd(struct mfs_client *clt,
-		struct imap_cmd *c)
-{
-	size_t ret;
-
-	ret = mfs_client_kernel_net_send(clt, c->str, c->len);
-	if(ret < 0)
-		return ret;
-
-	return 0;
-}
-
-static inline int mfs_imap_send_cmd(struct mfs_client *clt,
-		struct imap_cmd *c)
-{
-	struct imap *i = (struct imap*)clt->private_data;
-	int ret;
-
-	ret = kref_get_unless_zero(&c->refcnt);
-	if(ret == 0) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	ret = mfs_cmdqueue_add(&i->send, &c->next);
-
-out:
-	return ret;
-}
-
-/**
- * Send command to server, if rcv is not NULL the send is done synchronously and
- * the thread goes to sleep until the response arrives
- */
-static int _imap_send_cmd(struct mfs_client *clt, struct imap_cmd *send,
-		struct imap_msg **rcv)
-{
-	struct imap *i = (struct imap*)clt->private_data;
-	struct imap_rcv_handle *h;
-	unsigned int tagid;
-	ssize_t ret;
-
-	/**
-	 * Do async send
-	 */
-	if(rcv == NULL)
-		return mfs_imap_send_cmd(clt, send);
-	/**
-	 * Here we prepare everything to get a synchronous send
-	 */
-
-	/**
-	 * Set appropriate tag and reserved receive slot
-	 */
-	if(send->id == IMAPCMD_IDLE || send->id == IMAPCMD_DONE)
-		tagid = IDLETAG;
-	else
-		tagid = atomic_inc_return(&i->next_tag) % MAXTAG;
-
-	h = &i->rcv_handle[tagid];
-	if(atomic_cmpxchg(&h->reserved, 0, 1) != 0)
-		return -EAGAIN;
-
-	if(send->id != IMAPCMD_DONE) {
-		send->str[0] = tagid / 10 + '0';
-		send->str[1] = tagid % 10 + '0';
-	}
-
-	/**
-	 * Fill appropriate receive handler fields
-	 */
-	init_waitqueue_head(&h->qwait);
-	h->rcv = rcv;
-
-	if((send->cont) &&
-			(atomic_cmpxchg(&i->ctag, NRTAG, tagid) != NRTAG)) {
-		ret = -EAGAIN;
-		goto release;
-	}
-
-	/**
-	 * Use atomic_xchg() because it uses memory barrier in contrary of
-	 * atomic_set()
-	 */
-	if(atomic_xchg(&h->ready, 1) == 1)
-		pr_err("[MFS/IMAP]: Receiver handler list was corrupt");
-
-	ret = mfs_imap_send_cmd(clt, send);
-	if(ret < 0)
-		goto release;
-
-	/**
-	 * Sleep here waiting for response
-	 */
-	ret = wait_event_interruptible_timeout(h->qwait,
-			!atomic_read(&h->ready), IMAP_TIMEOUT);
-	if(ret < 0) {
-		goto release;
-	} else if(ret == 0) {
-		/**
-		 * Better error code for timeout
-		 */
-		ret = -EINVAL;
-		goto release;
-	}
-
-	ret = 0;
-
-release:
-	if(send->cont)
-		atomic_cmpxchg(&i->ctag, tagid, NRTAG);
-	/**
-	 * Release receive handler slot
-	 */
-	atomic_xchg(&h->ready, 0);
-	atomic_xchg(&h->reserved, 0);
-	return ret;
-}
-
-static inline int imap_send_idle(struct mfs_client *clt, struct imap_msg **r)
-{
-	struct imap *i = (struct imap*)clt->private_data;
-	struct imap_rcv_handle *h;
-	ssize_t ret;
-	static struct imap_cmd imap_idlecmd = {
-		.str = STR(IDLETAG) " IDLE" "\r\n",
-		.len = sizeof(STR(IDLETAG) " IDLE" "\r\n") - 1,
-		.id = IMAPCMD_IDLE,
-		.cont = 1
-	};
-
-	/**
-	 * Set appropriate tag and reserved receive slot
-	 */
-	h = &i->rcv_handle[IDLETAG];
-	if(atomic_cmpxchg(&h->reserved, 0, 1) != 0)
-		return -EAGAIN;
-
-	/**
-	 * Fill appropriate receive handler fields
-	 */
-	init_waitqueue_head(&h->qwait);
-	h->rcv = r;
-
-	if((atomic_cmpxchg(&i->ctag, NRTAG, IDLETAG) != NRTAG)) {
-		ret = -EAGAIN;
-		goto release;
-	}
-
-	/**
-	 * Use atomic_xchg() because it uses memory barrier in contrary of
-	 * atomic_set()
-	 */
-	if(atomic_xchg(&h->ready, 1) == 1)
-		pr_err("[MFS/IMAP]: Receiver handler list was corrupt");
-
-	ret = __mfs_imap_send_cmd(clt, &imap_idlecmd);
-	if(ret < 0)
-		goto release;
-
-	/**
-	 * Sleep here waiting for response
-	 */
-	ret = wait_event_interruptible_timeout(h->qwait,
-			!atomic_read(&h->ready), IMAP_TIMEOUT);
-	if(ret < 0) {
-		goto release;
-	} else if(ret == 0) {
-		/**
-		 * Better error code for timeout
-		 */
-		ret = -EINVAL;
-		goto release;
-	}
-
-	ret = 0;
-
-release:
-	atomic_cmpxchg(&i->ctag, IDLETAG, NRTAG);
-
-	/**
-	 * Release receive handler slot
-	 */
-	atomic_xchg(&h->ready, 0);
-	atomic_xchg(&h->reserved, 0);
-	return ret;
-}
-
-static inline int imap_send_unidle(struct mfs_client *clt, struct imap_msg **r)
-{
-	struct imap *i = (struct imap*)clt->private_data;
-	struct imap_rcv_handle *h;
-	ssize_t ret;
-	static struct imap_cmd imap_donecmd = {
-		.str = "DONE" "\r\n",
-		.len = sizeof("DONE" "\r\n") - 1,
-		.id = IMAPCMD_DONE,
-	};
-
-
-	/**
-	 * Set appropriate tag and reserved receive slot
-	 */
-	h = &i->rcv_handle[IDLETAG];
-	if(atomic_cmpxchg(&h->reserved, 0, 1) != 0)
-		return -EAGAIN;
-
-	/**
-	 * Fill appropriate receive handler fields
-	 */
-	init_waitqueue_head(&h->qwait);
-	h->rcv = r;
-
-	/**
-	 * Use atomic_xchg() because it uses memory barrier in contrary of
-	 * atomic_set()
-	 */
-	if(atomic_xchg(&h->ready, 1) == 1)
-		pr_err("[MFS/IMAP]: Receiver handler list was corrupt");
-
-	ret = __mfs_imap_send_cmd(clt, &imap_donecmd);
-	if(ret < 0)
-		goto release;
-
-	/**
-	 * Sleep here waiting for response
-	 */
-	ret = wait_event_interruptible_timeout(h->qwait,
-			!atomic_read(&h->ready), IMAP_TIMEOUT);
-	if(ret < 0) {
-		goto release;
-	} else if(ret == 0) {
-		/**
-		 * Better error code for timeout
-		 */
-		ret = -EINVAL;
-		goto release;
-	}
-
-	ret = 0;
-
-release:
-	/**
-	 * Release receive handler slot
-	 */
-	atomic_xchg(&h->ready, 0);
-	atomic_xchg(&h->reserved, 0);
-	return ret;
-}
-
-static int imap_unidle(struct mfs_client *clt)
-{
-	struct imap *i = (struct imap*)clt->private_data;
-	struct imap_msg *r;
-	struct imap_elt *e;
-	int ret;
-
-	/**
-	 * Here imap should be locked by imap_send_cmd
-	 */
-	ret = imap_send_unidle(clt, &r);
-	if(ret < 0)
-		goto out;
-
-	list_for_each_entry(e, &r->elt, next) {
-		if(!IMAP_ELT_ATOM(e))
-			continue;
-		ret = strcmp(IMAP_ELT_ATOM(e), "OK");
-		if(ret == 0)
-			break;
-	}
-
-	mfs_imap_msg_put(r);
-
-	if(ret > 0 || ret < 0) {
-		IMAP_DBG("Failed to unidle\n");
-		return -EINVAL;
-	}
-
-	atomic_xchg(&i->idling, 0);
-
-out:
-	return ret;
-}
-
-static int imap_send_cmd(struct mfs_client *clt, struct imap_cmd *send,
-		struct imap_msg **rcv)
-{
-	INIT_LIST_HEAD(&send->next);
-	return _imap_send_cmd(clt, send, rcv);
-}
-
-/**
- * This is the thread function that keep imap idling
- */
-static int imap_idle(void *data)
-{
-	struct mfs_client *clt = (struct mfs_client *)data;
-	struct imap *i = (struct imap*)clt->private_data;
-	struct imap_msg *r;
-	int ret;
-
-	while(!kthread_should_stop()) {
-		ret = wait_event_interruptible_timeout(i->idlwait,
-				!atomic_read(&i->idling), IMAP_IDLE_TIMEOUT);
-
-		if(kthread_should_stop())
-			break;
-
-		if(ret == -ERESTARTSYS)
-			continue;
-
-		/**
-		 * At idle timeout, we should first unidle
-		 */
-		if(atomic_read(&i->idling)) {
-			ret = imap_unidle(clt);
-			if(ret < 0) {
-				IMAP_DBG("Fail to unidle\n");
-				continue;
-			}
-		}
-
-		ret = imap_send_idle(clt, &r);
-		if(ret < 0) {
-			IMAP_DBG("Fail to idle\n");
-			continue;
-		}
-
-		mfs_imap_msg_put(r);
-
-	}
-
-	return 0;
-}
-
 #define list_last_entry(ptr, type, member) \
 	list_entry((ptr)->prev, type, member)
 
@@ -868,7 +471,7 @@ static int imap_new_mail(struct mfs_client *clt, struct imap_msg *m)
 	if(IS_ERR(c))
 		return 0;
 
-	ret = imap_send_cmd(clt, c, NULL);
+	ret = mfs_imap_send_cmd(clt, c, NULL);
 
 	imap_cleanup_cmd(c);
 
@@ -1076,52 +679,6 @@ static int imap_receive(void *data)
 	return 0;
 }
 
-static int imap_send(void *data)
-{
-	struct mfs_client *clt = (struct mfs_client *)data;
-	struct imap *i = (struct imap*)clt->private_data;
-	struct list_head *msg;
-	struct imap_cmd *c, *n;
-	int ret;
-
-	while(!kthread_should_stop()) {
-		ret = mfs_cmdqueue_wait(&i->send, &msg);
-		if(ret < 0) {
-			list_for_each_entry_safe(c, n, msg, next) {
-				list_del(&c->next);
-				imap_cleanup_cmd(c);
-			}
-			continue;
-		}
-
-		list_for_each_entry_safe(c, n, msg, next) {
-			if(atomic_read(&i->idling)) {
-				do {
-					schedule();
-					ret = imap_unidle(clt);
-				} while(ret == -EAGAIN);
-				if(ret < 0) {
-					imap_cleanup_cmd(c);
-					continue;
-				}
-			}
-
-			__mfs_imap_send_cmd(clt, c);
-			list_del(&c->next);
-			imap_cleanup_cmd(c);
-
-			if(!atomic_read(&i->idling) &&
-					!(i->flags & IMAP_EXIT) &&
-					!(i->flags & IMAP_INIT)) {
-				wake_up_interruptible(&i->idlwait);
-				ret = wait_event_interruptible_timeout(i->idlwait, atomic_read(&i->idling), IMAP_IDLE_TIMEOUT);
-			}
-		}
-	}
-
-	return 0;
-}
-
 static int imap_get_msg_body(struct mfs_client *clt, struct message *msg)
 {
 	struct imap_cmd *c;
@@ -1136,7 +693,7 @@ static int imap_get_msg_body(struct mfs_client *clt, struct message *msg)
 
 	list_add_tail(&msg->fetch_next, &i->fetching);
 
-	ret = imap_send_cmd(clt, c, &r);
+	ret = mfs_imap_send_cmd(clt, c, &r);
 
 	imap_cleanup_cmd(c);
 	list_del(&msg->fetch_next);
@@ -1182,7 +739,7 @@ static inline int mfs_imap_login(struct mfs_client *clt)
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
-	ret = imap_send_cmd(clt, c, &r);
+	ret = mfs_imap_send_cmd(clt, c, &r);
 
 	imap_cleanup_cmd(c);
 
@@ -1220,7 +777,7 @@ static inline int mfs_imap_get_boxes(struct mfs_client *clt)
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
-	ret = imap_send_cmd(clt, c, &r);
+	ret = mfs_imap_send_cmd(clt, c, &r);
 
 	imap_cleanup_cmd(c);
 
@@ -1269,7 +826,7 @@ static inline int mfs_imap_select_inbox(struct mfs_client *clt)
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
-	ret = imap_send_cmd(clt, c, &r);
+	ret = mfs_imap_send_cmd(clt, c, &r);
 
 	imap_cleanup_cmd(c);
 
@@ -1310,7 +867,7 @@ static inline int mfs_imap_list_mail(struct mfs_client *clt)
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
-	ret = imap_send_cmd(clt, c, &r);
+	ret = mfs_imap_send_cmd(clt, c, &r);
 
 	imap_cleanup_cmd(c);
 
@@ -1350,7 +907,8 @@ static int mfs_imap_connect(struct mfs_client *clt)
 	clt->private_data = i;
 
 	i->rcv_thread = kthread_run(imap_receive, clt, "kmfs_imap_rcv");
-	i->snd_thread = kthread_run(imap_send, clt, "kmfs_imap_send");
+	i->snd_thread = kthread_run(mfs_imap_send_process, clt,
+			"kmfs_imap_send");
 
 	mfs_imap_wait_conn(i, 0);
 
@@ -1370,7 +928,8 @@ static int mfs_imap_connect(struct mfs_client *clt)
 	if(ret < 0)
 		return ret;
 
-	i->idl_thread = kthread_run(imap_idle, clt, "kmfs_imap_idle");
+	i->idl_thread = kthread_run(mfs_imap_keep_idling, clt,
+			"kmfs_imap_idle");
 	i->flags &= ~IMAP_INIT;
 
 	return ret;
@@ -1401,7 +960,7 @@ static void mfs_imap_close(struct mfs_client *clt)
 		goto ifree;
 
 	i->flags |= IMAP_EXIT;
-	imap_send_cmd(clt, c, NULL);
+	mfs_imap_send_cmd(clt, c, NULL);
 	imap_cleanup_cmd(c);
 
 
