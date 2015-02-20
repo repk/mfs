@@ -6,7 +6,11 @@
 #include "mfs_client.h"
 #include "mfs_imap.h"
 
+#if 0
+#define MFS_PORT 1215
+#else
 #define MFS_PORT 143
+#endif
 
 /**
  * -------------------------------------
@@ -104,13 +108,15 @@ ssize_t mfs_client_net_recv(struct mfs_client *clt, char __user *buf,
 ssize_t mfs_client_kernel_net_recv(struct mfs_client *clt, char *buf,
 		size_t size)
 {
-	struct msghdr msg = {};
+	struct msghdr msg = {
+		.msg_flags = MSG_NOSIGNAL
+	};
 	struct kvec iov = {
 		.iov_base = buf,
 		.iov_len = size,
 	};
 
-	return kernel_recvmsg(clt->cs, &msg, &iov, 1, size, 0);
+	return kernel_recvmsg(clt->cs, &msg, &iov, 1, size, msg.msg_flags);
 }
 
 /**
@@ -158,7 +164,9 @@ ssize_t mfs_client_net_send(struct mfs_client *clt, const char __user *buf,
 ssize_t mfs_client_kernel_net_send(struct mfs_client *clt, const char *buf,
 		size_t size)
 {
-	struct msghdr msg = {};
+	struct msghdr msg = {
+		.msg_flags = MSG_NOSIGNAL
+	};
 	struct kvec iov = {
 		.iov_base = (void *)buf,
 		.iov_len = size,

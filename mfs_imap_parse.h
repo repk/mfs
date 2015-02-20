@@ -40,10 +40,35 @@ struct imap_msg {
 	struct list_head elt;
 };
 
+#define ISTACK_MAX 16
+struct imap_parse_stack {
+	size_t idx;
+	struct imap_msg *st[ISTACK_MAX];
+};
+
+struct imap_parse_ctx {
+	struct imap_parse_stack st;
+	struct imap_msg *first;
+	struct imap_msg *msg;
+	struct imap_elt *elt;
+	size_t more;
+};
+
+/**
+ * Create a new context for imap parsing
+ */
+struct imap_parse_ctx *mfs_imap_parse_new_ctx(void);
+
+/**
+ * Delete a imap parsing context
+ */
+void mfs_imap_parse_del_ctx(struct imap_parse_ctx *ctx);
+
 /**
  * Transform received message into structured imap message
  */
-struct imap_msg *mfs_imap_parse_msg(char const **msg, size_t *len);
+struct imap_msg *mfs_imap_parse_msg(struct imap_parse_ctx *ctx,
+		char const **msg, size_t *len);
 /**
  * Get a reference on imap msg
  *
