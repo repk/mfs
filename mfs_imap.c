@@ -232,6 +232,7 @@ static inline struct imap *mfs_imap_alloc(ssize_t mcachesz)
 		i->mcachesz = mcachesz;
 		init_waitqueue_head(&i->rcvwait);
 		init_waitqueue_head(&i->idlwait);
+		init_waitqueue_head(&i->conwait);
 		mfs_cmdqueue_init(&i->send);
 		INIT_LIST_HEAD(&i->boxes);
 		INIT_LIST_HEAD(&i->fetching);
@@ -252,9 +253,16 @@ static inline void mfs_imap_free(struct imap *imap)
 	kfree(imap);
 }
 
-static void mfs_imap_wait_conn(struct imap *i, int intr)
+static int mfs_imap_wait_conn(struct imap *i)
 {
-	wait_event(i->rcvwait, i->flags & IMAP_CONN);
+	int ret;
+
+	ret = wait_event_interruptible_timeout(i->rcvwait,
+			i->flags & IMAP_CONN, IMAP_TIMEOUT);
+	if(ret == 0)
+		ret = -EAGAIN;
+
+	return ret;
 }
 
 #define MFS_IMAP_ALLOC() mfs_imap_alloc(MSGCACHESZ)
@@ -341,12 +349,24 @@ static int imap_rm_mail(struct mfs_client *clt, char const *name)
 
 static int imap_rcv_box(struct mfs_client *clt, struct imap_msg *m)
 {
+	struct imap *i = (struct imap *)clt->private_data;
 	struct imap_elt *e;
+	struct box *b;
 	int ret;
 
 	e = list_last_entry(&m->elt, struct imap_elt, next);
 	if(e->type != IET_ATOM)
 		IMAP_DBG("Wrong box list message\n");
+
+	/**
+	 * If box already here, exit
+	 */
+	list_for_each_entry(b, &i->boxes, next) {
+		if(strcmp(b->name, IMAP_ELT_ATOM(e)) == 0) {
+			IMAP_DBG("Box already created\n");
+			return 0;
+		}
+	}
 
 	ret = imap_add_box(clt, IMAP_ELT_ATOM(e));
 	if(ret != 0) {
@@ -632,14 +652,37 @@ static inline int imap_process_msg(struct mfs_client *clt, struct imap_msg *msg)
 
 #define MFS_IMAP_BUFLEN 2048
 
+static int imap_wait_hello(struct mfs_client *clt)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+	ssize_t l;
+
+	l = mfs_client_kernel_wait_recv(clt, 7 * HZ);
+
+
+	if(l > 0) {
+		i->flags |= IMAP_CONN;
+		/**
+		 * Wake up all connection waiting process
+		 */
+		wake_up_all(&i->rcvwait);
+	} else if(l == 0) {
+		l = -EIO;
+	}
+
+	return l;
+}
+
 static int imap_receive(void *data)
 {
 	struct imap_msg *im;
 	struct mfs_client *clt = (struct mfs_client *)data;
 	struct imap_parse_ctx *c;
+	struct imap *i = (struct imap *)clt->private_data;
 	char *b;
 	char const *p;
 	size_t l = 0;
+	int ret;
 
 	b = kmalloc(MFS_IMAP_BUFLEN * sizeof(*b), GFP_KERNEL);
 	if(b == NULL) {
@@ -660,8 +703,22 @@ static int imap_receive(void *data)
 		if(kthread_should_stop())
 			break;
 
-		if(l <= 0)
+		if(l < 0) {
+			schedule();
 			continue;
+		}
+
+		/**
+		 * This is a disconnection, try to reconnect
+		 */
+		if(l == 0) {
+			i->flags &= ~IMAP_CONN;
+			wake_up_interruptible(&i->conwait);
+			do {
+				ret = mfs_imap_wait_conn(i);
+			} while(!kthread_should_stop() && ret <= 0);
+			continue;
+		}
 
 		p = b;
 		/**
@@ -906,11 +963,13 @@ static int mfs_imap_connect(struct mfs_client *clt)
 
 	clt->private_data = i;
 
+	ret = imap_wait_hello(clt);
+	if(ret < 0)
+		return ret;
+
 	i->rcv_thread = kthread_run(imap_receive, clt, "kmfs_imap_rcv");
 	i->snd_thread = kthread_run(mfs_imap_send_process, clt,
 			"kmfs_imap_send");
-
-	mfs_imap_wait_conn(i, 0);
 
 	ret = mfs_imap_login(clt);
 	if(ret < 0)
@@ -930,6 +989,42 @@ static int mfs_imap_connect(struct mfs_client *clt)
 
 	i->idl_thread = kthread_run(mfs_imap_keep_idling, clt,
 			"kmfs_imap_idle");
+	i->con_thread = kthread_run(mfs_imap_keep_connected, clt,
+			"kmfs_imap_con");
+	i->flags &= ~IMAP_INIT;
+
+	return ret;
+}
+
+static int mfs_imap_reconnect(struct mfs_client *clt)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+	int ret = 0;
+
+	i->flags |= IMAP_INIT;
+
+	wake_up_all(&i->rcvwait);
+
+	ret = imap_wait_hello(clt);
+	if(ret < 0)
+		return ret;
+
+	ret = mfs_imap_login(clt);
+	if(ret < 0)
+		return ret;
+
+	ret = mfs_imap_get_boxes(clt);
+	if(ret < 0)
+		return ret;
+
+	ret = mfs_imap_select_inbox(clt);
+	if(ret < 0)
+		return ret;
+
+	ret = mfs_imap_list_mail(clt);
+	if(ret < 0)
+		return ret;
+
 	i->flags &= ~IMAP_INIT;
 
 	return ret;
@@ -946,6 +1041,8 @@ static void mfs_imap_kill_thread(struct imap *i)
 	kthread_stop(i->rcv_thread);
 	force_sig(SIGHUP, i->snd_thread);
 	kthread_stop(i->snd_thread);
+	force_sig(SIGHUP, i->con_thread);
+	kthread_stop(i->con_thread);
 	force_sig(SIGHUP, i->idl_thread);
 	kthread_stop(i->idl_thread);
 }
@@ -1016,6 +1113,7 @@ static ssize_t mfs_imap_write(struct mfs_client *clt, struct file *f,
 struct mfs_client_operations imapops = {
 	.connect = mfs_imap_connect,
 	.close = mfs_imap_close,
+	.reconnect = mfs_imap_reconnect,
 	.read = mfs_imap_read,
 	.write = mfs_imap_write,
 };

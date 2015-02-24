@@ -2,6 +2,7 @@
 #include <linux/inet.h>
 #include <linux/in.h>
 #include <linux/netdevice.h>
+#include <net/sock.h>
 
 #include "mfs_client.h"
 #include "mfs_imap.h"
@@ -20,44 +21,79 @@
 
 
 /**
+ * Close a connected socket
+ */
+static inline void client_close_socket(struct mfs_client *clt)
+{
+	if(clt->cs != NULL)
+		sock_release(clt->cs);
+
+	clt->cs = NULL;
+}
+
+/**
+ * Create a new socket and connect it
+ */
+static inline struct socket *client_open_socket(struct mfs_client *clt)
+{
+	struct socket *cs;
+	int e = 0;
+
+	/**
+	 * XXX should I use sock_create() instead ?
+	 */
+	e = __sock_create(read_pnet(&current->nsproxy->net_ns), PF_INET,
+			SOCK_STREAM, IPPROTO_TCP, &cs, 1);
+	if(e != 0)
+		goto err;
+
+	e = cs->ops->connect(cs, (struct sockaddr *)&clt->sin,
+			sizeof(clt->sin), 0);
+	if(e < 0)
+		goto sockrelease;
+
+	return cs;
+
+sockrelease:
+	sock_release(cs);
+err:
+	return ERR_PTR(e);
+}
+
+
+/**
  * Init a network session with server
  */
 int mfs_client_init_session(struct mfs_client *clt, char const *addr,
 		char *data)
 {
-	struct sockaddr_in sin;
+	struct sockaddr_in *sin = &clt->sin;
 	struct socket *cs;
-	int err;
+	int e;
 
-	sin.sin_family = AF_INET;
-	sin.sin_addr.s_addr = in_aton(addr);
-	sin.sin_port = htons(MFS_PORT);
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = in_aton(addr);
+	sin->sin_port = htons(MFS_PORT);
 
-	/**
-	 * XXX should I use sock_create() instead ?
-	 */
-	err = __sock_create(read_pnet(&current->nsproxy->net_ns), PF_INET,
-			SOCK_STREAM, IPPROTO_TCP, &cs, 1);
-	if(err != 0)
+	cs = client_open_socket(clt);
+	if(IS_ERR_OR_NULL(cs)) {
+		e = PTR_ERR(cs);
 		goto err;
-
-	err = cs->ops->connect(cs, (struct sockaddr *)&sin, sizeof(sin), 0);
-	if(err < 0)
-		goto sockrelease;
+	}
 
 	clt->cs = cs;
 	clt->ops = &imapops;
 
-	err = clt->ops->connect(clt);
-	if(err < 0)
-		goto sockrelease;
+	e = clt->ops->connect(clt);
+	if(e < 0)
+		goto closesock;
 
 	return 0;
 
-sockrelease:
-	sock_release(cs);
+closesock:
+	client_close_socket(clt);
 err:
-	return err;
+	return e;
 }
 
 /**
@@ -66,7 +102,38 @@ err:
 void mfs_client_close_session(struct mfs_client *clt)
 {
 	clt->ops->close(clt);
-	sock_release(clt->cs);
+	client_close_socket(clt);
+}
+
+/**
+ * Restart network session
+ */
+int mfs_client_restart_session(struct mfs_client *clt)
+{
+	struct socket *cs = NULL;
+	int e;
+
+	client_close_socket(clt);
+
+	cs = client_open_socket(clt);
+	if(IS_ERR_OR_NULL(cs)) {
+		e = PTR_ERR(cs);
+		goto err;
+	}
+
+	clt->cs = cs;
+	clt->ops = &imapops;
+
+	e = clt->ops->reconnect(clt);
+	if(e < 0)
+		goto closesock;
+
+	return 0;
+
+closesock:
+	client_close_socket(clt);
+err:
+	return e;
 }
 
 /**
@@ -187,4 +254,31 @@ ssize_t mfs_client_write(struct mfs_client *clt, struct file *f,
 		return mfs_client_net_send(clt, buf, size);
 
 	return clt->ops->write(clt, f, i->i_private, buf, size);
+}
+
+/**
+ * Wait for socket to have message to be read
+ */
+int mfs_client_kernel_wait_recv(struct mfs_client *clt, long timeout)
+{
+	char b;
+	ssize_t ret;
+	long timeo_old;
+	struct msghdr msg = {
+		.msg_flags = MSG_NOSIGNAL | MSG_PEEK
+	};
+	struct kvec iov = {
+		.iov_base = &b,
+		.iov_len = 1,
+	};
+
+
+	timeo_old = clt->cs->sk->sk_rcvtimeo;
+	clt->cs->sk->sk_rcvtimeo = timeout;
+
+	ret = kernel_recvmsg(clt->cs, &msg, &iov, 1, 1, msg.msg_flags);
+
+	clt->cs->sk->sk_rcvtimeo = timeo_old;
+
+	return ret;
 }

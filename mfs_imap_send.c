@@ -5,6 +5,7 @@
 #include <linux/wait.h>
 #include <linux/kthread.h>
 #include <linux/jiffies.h>
+#include <linux/delay.h>
 
 #include "mfs_client.h"
 #include "mfs_imap.h"
@@ -324,6 +325,39 @@ out:
 	return ret;
 }
 
+#define IMAP_RECO_WAIT 2000 /* 2 sec */
+
+/**
+ * This is the thread function that keep imap connected
+ */
+int mfs_imap_keep_connected(void *data)
+{
+	struct mfs_client *clt = (struct mfs_client *)data;
+	struct imap *i = (struct imap*)clt->private_data;
+	int ret;
+
+	while(!kthread_should_stop()) {
+		ret = wait_event_interruptible(i->conwait,
+				!(i->flags & IMAP_CONN));
+
+		if(kthread_should_stop())
+			break;
+
+		if(ret == -ERESTARTSYS)
+			continue;
+
+		IMAP_DBG("Reconnect\n");
+		atomic_xchg(&i->idling, 0);
+		ret = mfs_client_restart_session(clt);
+		if(ret != 0) {
+			IMAP_DBG("Fail to reconnect retrying\n");
+			msleep(IMAP_RECO_WAIT);
+		}
+	}
+
+	return 0;
+}
+
 /**
  * This is the thread function that keep imap idling
  */
@@ -335,13 +369,20 @@ int mfs_imap_keep_idling(void *data)
 
 	while(!kthread_should_stop()) {
 		ret = wait_event_interruptible_timeout(i->idlwait,
-				!atomic_read(&i->idling), IMAP_IDLE_TIMEOUT);
+				!atomic_read(&i->idling) ||
+				!(i->flags & IMAP_CONN), IMAP_IDLE_TIMEOUT);
 
 		if(kthread_should_stop())
 			break;
 
 		if(ret == -ERESTARTSYS)
 			continue;
+
+		if(!(i->flags & IMAP_CONN)) {
+			/**
+			 * TODO: wait for reco here
+			 */
+		}
 
 		/**
 		 * At idle timeout, we should first unidle

@@ -6,6 +6,11 @@
 #include "mfs_imap_parse.h"
 
 /**
+ * This is the thread function that keep imap connected
+ */
+int mfs_imap_keep_connected(void *data);
+
+/**
  * This is the thread function that keep imap idling
  */
 int mfs_imap_keep_idling(void *data);

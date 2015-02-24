@@ -43,6 +43,7 @@ struct message;
 
 struct imap {
 	struct task_struct *rcv_thread;
+	struct task_struct *con_thread;
 	struct task_struct *snd_thread;
 	struct task_struct *idl_thread;
 	struct mfs_cmdqueue send;
@@ -52,6 +53,7 @@ struct imap {
 	struct box *selbox;
 	wait_queue_head_t rcvwait;
 	wait_queue_head_t idlwait;
+	wait_queue_head_t conwait;
 	size_t mcachesz;
 	atomic_t next_tag;
 	atomic_t ctag;
