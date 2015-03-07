@@ -13,6 +13,13 @@ learn how fs and networking work inside linux kernel. If you still want to give
 it a shot I strongly recommend to test it in a VM.
 
 
+Build it
+--------
+
+Simply run "make". Hopefully everything will build ok.
+To compile with debug kernel messages run "make DEBUG=1"
+
+
 How to use it
 -------------
 

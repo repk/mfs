@@ -12,8 +12,6 @@
 #include "mfs_cmdqueue.h"
 #include "mfs_imap_send.h"
 
-#define DEBUG
-
 #ifndef DEBUG
 #define IMAP_DBG(...)
 #else

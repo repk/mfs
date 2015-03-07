@@ -15,8 +15,6 @@
 #include "mfs_imap_send.h"
 #include "mfs_imap_parse.h"
 
-#define DEBUG
-
 #ifndef DEBUG
 #define IMAP_DBG(...)
 #else

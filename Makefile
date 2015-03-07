@@ -7,12 +7,17 @@ BUILDDIR := build
 KBUILD := $(BUILDDIR)/fs
 KOBJ := $(SRC:%.c=%.o)
 
+ifeq ($(DEBUG), 1)
+KFLAGS := -DDEBUG=1
+endif
+
 # We are called from the kernel (this makefile call the kernel's one which
 # call's this one. So if KERNELRELEASE is defined we are at the second called to
 # this makefile
 ifneq ($(KERNELRELEASE),)
 	obj-m := mfs.o
 	mfs-y := $(KOBJ)
+	ccflags-y := $(KFLAGS)
 
 # Here we are at the first call
 else
