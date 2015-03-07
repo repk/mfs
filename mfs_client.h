@@ -3,12 +3,17 @@
 
 #include <linux/netdevice.h>
 
+struct mfs_client_opt {
+	unsigned short port;
+};
+
 struct mfs_client {
 	struct socket *cs;
 	struct mfs_client_operations *ops;
 	struct super_block *sb;
 	void *private_data;
 	struct sockaddr_in sin;
+	struct mfs_client_opt opt;
 };
 
 struct mfs_client_operations {

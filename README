@@ -18,7 +18,7 @@ How to use it
 
 As root user:
 	insmod ./mfs.ko
-	mount -tmfs IPADDR /mnt/mail
+	mount -o port=IMAPPORT -tmfs IPADDR /mnt/mail
 
 As normal user:
 	ls /mnt/mail/INBOX

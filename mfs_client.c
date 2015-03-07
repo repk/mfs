@@ -7,11 +7,7 @@
 #include "mfs_client.h"
 #include "mfs_imap.h"
 
-#if 0
-#define MFS_PORT 1215
-#else
-#define MFS_PORT 143
-#endif
+#define MFS_DFT_PORT 143
 
 /**
  * -------------------------------------
@@ -60,6 +56,27 @@ err:
 	return ERR_PTR(e);
 }
 
+static int mfs_client_parse_opt(struct mfs_client *clt, char *opt)
+{
+	char *p;
+	unsigned short port;
+	int ret;
+
+	clt->opt.port = MFS_DFT_PORT;
+
+	if(opt == NULL)
+		return 0;
+
+	p = strstr(opt, "port=");
+	if(p != NULL) {
+		ret = sscanf(p, "port=%hu", &port);
+		if(ret == 1)
+			clt->opt.port = port;
+	}
+
+	return 0;
+}
+
 
 /**
  * Init a network session with server
@@ -71,9 +88,13 @@ int mfs_client_init_session(struct mfs_client *clt, char const *addr,
 	struct socket *cs;
 	int e;
 
+	e = mfs_client_parse_opt(clt, data);
+	if(e != 0)
+		goto err;
+
 	sin->sin_family = AF_INET;
 	sin->sin_addr.s_addr = in_aton(addr);
-	sin->sin_port = htons(MFS_PORT);
+	sin->sin_port = htons(clt->opt.port);
 
 	cs = client_open_socket(clt);
 	if(IS_ERR_OR_NULL(cs)) {
