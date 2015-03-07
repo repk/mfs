@@ -41,6 +41,11 @@ struct imap_rcv_handle {
 struct box;
 struct message;
 
+struct imap_opt {
+	char *login;
+	char *pass;
+};
+
 struct imap {
 	struct task_struct *rcv_thread;
 	struct task_struct *con_thread;
@@ -54,6 +59,7 @@ struct imap {
 	wait_queue_head_t rcvwait;
 	wait_queue_head_t idlwait;
 	wait_queue_head_t conwait;
+	struct imap_opt opt;
 	size_t mcachesz;
 	atomic_t next_tag;
 	atomic_t ctag;

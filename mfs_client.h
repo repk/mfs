@@ -17,7 +17,7 @@ struct mfs_client {
 };
 
 struct mfs_client_operations {
-	int (*connect)(struct mfs_client *clt);
+	int (*connect)(struct mfs_client *clt, char *data);
 	void (*close)(struct mfs_client *clt);
 	int (*reconnect)(struct mfs_client *clt);
 	ssize_t (*read)(struct mfs_client *clt, struct file *f, void *pdata,

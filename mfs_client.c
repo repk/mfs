@@ -77,7 +77,6 @@ static int mfs_client_parse_opt(struct mfs_client *clt, char *opt)
 	return 0;
 }
 
-
 /**
  * Init a network session with server
  */
@@ -105,14 +104,12 @@ int mfs_client_init_session(struct mfs_client *clt, char const *addr,
 	clt->cs = cs;
 	clt->ops = &imapops;
 
-	e = clt->ops->connect(clt);
+	e = clt->ops->connect(clt, data);
 	if(e < 0)
-		goto closesock;
+		goto err;
 
 	return 0;
 
-closesock:
-	client_close_socket(clt);
 err:
 	return e;
 }

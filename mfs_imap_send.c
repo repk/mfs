@@ -429,6 +429,8 @@ int mfs_imap_send_process(void *data)
 	while(!kthread_should_stop()) {
 		ret = mfs_cmdqueue_wait(&i->send, &msg);
 		if(ret < 0) {
+			if(msg == NULL)
+				continue;
 			list_for_each_entry_safe(c, n, msg, next) {
 				list_del(&c->next);
 				imap_cleanup_cmd(c);

@@ -31,9 +31,6 @@
 #define MSGCACHESZ 128
 #define BODYMAXLEN (1 << 16)
 
-#define NAME "test"
-#define PASS "test"
-
 enum mfs_imap_f_type {
 	MFS_IMAP_F_UNKNOWN,
 	MFS_IMAP_F_MAIL,
@@ -222,6 +219,77 @@ static void imap_del_box(struct box *b)
 	kfree(b);
 }
 
+static inline void mfs_imap_opt_init(struct imap_opt *opt)
+{
+	/**
+	 * Put not NULL initialization HERE
+	 */
+}
+
+static inline void mfs_imap_opt_clean(struct imap_opt *opt)
+{
+	if(opt->login)
+		kfree(opt->login);
+	if(opt->pass)
+		kfree(opt->pass);
+}
+
+static inline int mfs_imap_opt_login(struct imap_opt *opt, char *sopt)
+{
+	char *p, *e;
+	char *login;
+
+	p = strstr(sopt, "login=");
+	if(p == NULL) {
+		IMAP_DBG("Missing login\n");
+		return -EINVAL;
+	}
+	p += strlen("login=");
+
+	e = strchr(p, ',');
+	if(e == NULL)
+		e = p + strlen(sopt);
+
+	login = kmalloc(e - p + 1, GFP_KERNEL);
+	if(login == NULL)
+		return -EINVAL;
+
+	memcpy(login, p, e - p);
+	login[e - p] = '\0';
+
+	opt->login = login;
+
+	return 0;
+}
+
+static inline int mfs_imap_opt_pass(struct imap_opt *opt, char *sopt)
+{
+	char *p, *e;
+	char *pass;
+
+	p = strstr(sopt, "pass=");
+	if(p == NULL) {
+		IMAP_DBG("Missing pass\n");
+		return -EINVAL;
+	}
+	p += strlen("pass=");
+
+	e = strchr(p, ',');
+	if(e == NULL)
+		e = p + strlen(sopt);
+
+	pass = kmalloc(e - p + 1, GFP_KERNEL);
+	if(pass == NULL)
+		return -EINVAL;
+
+	memcpy(pass, p, e - p);
+	pass[e - p] = '\0';
+
+	opt->pass = pass;
+
+	return 0;
+}
+
 static inline struct imap *mfs_imap_alloc(ssize_t mcachesz)
 {
 	struct imap *i;
@@ -238,6 +306,7 @@ static inline struct imap *mfs_imap_alloc(ssize_t mcachesz)
 		INIT_LIST_HEAD(&i->fetching);
 		atomic_set(&i->ctag, NRTAG);
 		i->flags |= IMAP_INIT;
+		mfs_imap_opt_init(&i->opt);
 	}
 
 	return i;
@@ -249,6 +318,8 @@ static inline void mfs_imap_free(struct imap *imap)
 
 	list_for_each_entry_safe(p, n, &imap->boxes, next)
 		imap_del_box(p);
+
+	mfs_imap_opt_clean(&imap->opt);
 
 	kfree(imap);
 }
@@ -792,7 +863,7 @@ static inline int mfs_imap_login(struct mfs_client *clt)
 	struct imap_msg *r;
 	int ret;
 
-	c = imap_create_cmd(i, IMAPCMD_LOGIN, NAME, PASS);
+	c = imap_create_cmd(i, IMAPCMD_LOGIN, i->opt.login, i->opt.pass);
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
@@ -815,7 +886,7 @@ static inline int mfs_imap_login(struct mfs_client *clt)
 
 	if(ret > 0 || ret < 0) {
 		IMAP_DBG("Failed to login\n");
-		return -EINVAL;
+		return -EACCES;
 	}
 
 out:
@@ -952,7 +1023,32 @@ out:
 	return ret;
 }
 
-static int mfs_imap_connect(struct mfs_client *clt)
+static inline int imap_parse_opt(struct mfs_client *clt, char *data)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+	int ret = -EINVAL;
+
+	if(data == NULL) {
+		IMAP_DBG("Missing imap options\n");
+		goto err;
+	}
+
+	ret = mfs_imap_opt_login(&i->opt, data);
+	if(ret < 0)
+		goto err;
+
+	ret = mfs_imap_opt_pass(&i->opt, data);
+	if(ret < 0)
+		goto err;
+
+	return 0;
+
+err:
+	mfs_imap_opt_clean(&i->opt);
+	return ret;
+}
+
+static int mfs_imap_connect(struct mfs_client *clt, char *data)
 {
 	struct imap *i;
 	int ret = 0;
@@ -963,9 +1059,13 @@ static int mfs_imap_connect(struct mfs_client *clt)
 
 	clt->private_data = i;
 
+	ret = imap_parse_opt(clt, data);
+	if(ret < 0)
+		goto out;
+
 	ret = imap_wait_hello(clt);
 	if(ret < 0)
-		return ret;
+		goto out;
 
 	i->rcv_thread = kthread_run(imap_receive, clt, "kmfs_imap_rcv");
 	i->snd_thread = kthread_run(mfs_imap_send_process, clt,
@@ -973,19 +1073,19 @@ static int mfs_imap_connect(struct mfs_client *clt)
 
 	ret = mfs_imap_login(clt);
 	if(ret < 0)
-		return ret;
+		goto out;
 
 	ret = mfs_imap_get_boxes(clt);
 	if(ret < 0)
-		return ret;
+		goto out;
 
 	ret = mfs_imap_select_inbox(clt);
 	if(ret < 0)
-		return ret;
+		goto out;
 
 	ret = mfs_imap_list_mail(clt);
 	if(ret < 0)
-		return ret;
+		goto out;
 
 	i->idl_thread = kthread_run(mfs_imap_keep_idling, clt,
 			"kmfs_imap_idle");
@@ -993,6 +1093,7 @@ static int mfs_imap_connect(struct mfs_client *clt)
 			"kmfs_imap_con");
 	i->flags &= ~IMAP_INIT;
 
+out:
 	return ret;
 }
 
@@ -1040,18 +1141,22 @@ static void mfs_imap_kill_thread(struct imap *i)
 	if(i->rcv_thread) {
 		force_sig(SIGHUP, i->rcv_thread);
 		kthread_stop(i->rcv_thread);
+		i->rcv_thread = NULL;
 	}
 	if(i->snd_thread) {
 		force_sig(SIGHUP, i->snd_thread);
 		kthread_stop(i->snd_thread);
+		i->snd_thread = NULL;
 	}
 	if(i->con_thread) {
 		force_sig(SIGHUP, i->con_thread);
 		kthread_stop(i->con_thread);
+		i->con_thread = NULL;
 	}
 	if(i->idl_thread) {
 		force_sig(SIGHUP, i->idl_thread);
 		kthread_stop(i->idl_thread);
+		i->idl_thread = NULL;
 	}
 }
 
