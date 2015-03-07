@@ -17,12 +17,25 @@ How to use it
 -------------
 
 As root user:
-	insmod ./mfs.ko
+	insmod ./build/fs/mfs.ko
 	mount -o port=IMAPPORT,login=IMAPLOGIN,pass=IMAPPASS -tmfs IPADDR /mnt/mail
 
 As normal user:
 	ls /mnt/mail/INBOX
 	cat /mnt/mail/INBOX/12
+
+
+Mount helper
+------------
+
+In order to avoid to write your password in clear text on the command line, a
+helper is in build/tools/mount.mfs.
+
+First as root user copy build/tools/mount.mfs in /sbin then use mount as below:
+	insmod ./build/fs/mfs.ko
+	mount -o port=IMAPPORT,login=IMAPLOGIN -tmfs IPADDR /mnt/mail
+
+It will ask you to enter imap password at mount time without printing it.
 
 
 TODO (not in order)
