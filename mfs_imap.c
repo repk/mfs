@@ -1037,14 +1037,22 @@ static void mfs_imap_kill_thread(struct imap *i)
 	 * TODO set thread state to stop, use smb_mb() init_completion
 	 * and wait_for_completion
 	 */
-	force_sig(SIGHUP, i->rcv_thread);
-	kthread_stop(i->rcv_thread);
-	force_sig(SIGHUP, i->snd_thread);
-	kthread_stop(i->snd_thread);
-	force_sig(SIGHUP, i->con_thread);
-	kthread_stop(i->con_thread);
-	force_sig(SIGHUP, i->idl_thread);
-	kthread_stop(i->idl_thread);
+	if(i->rcv_thread) {
+		force_sig(SIGHUP, i->rcv_thread);
+		kthread_stop(i->rcv_thread);
+	}
+	if(i->snd_thread) {
+		force_sig(SIGHUP, i->snd_thread);
+		kthread_stop(i->snd_thread);
+	}
+	if(i->con_thread) {
+		force_sig(SIGHUP, i->con_thread);
+		kthread_stop(i->con_thread);
+	}
+	if(i->idl_thread) {
+		force_sig(SIGHUP, i->idl_thread);
+		kthread_stop(i->idl_thread);
+	}
 }
 
 static void mfs_imap_close(struct mfs_client *clt)
@@ -1052,17 +1060,20 @@ static void mfs_imap_close(struct mfs_client *clt)
 	struct imap *i = (struct imap *)clt->private_data;
 	struct imap_cmd *c;
 
+	if(i == NULL)
+		return;
+
 	c = imap_create_cmd(i, IMAPCMD_LOGOUT);
 	if(IS_ERR(c))
-		goto ifree;
+		goto killthread;
 
 	i->flags |= IMAP_EXIT;
 	mfs_imap_send_cmd(clt, c, NULL);
 	imap_cleanup_cmd(c);
 
 
+killthread:
 	mfs_imap_kill_thread(i);
-ifree:
 	MFS_IMAP_FREE(clt->private_data);
 }
 

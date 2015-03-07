@@ -56,6 +56,8 @@ static struct dentry *mfs_mod_mount(struct file_system_type *fst, int flags,
 
 release_sb:
 	deactivate_locked_super(sb);
+	return ERR_PTR(err);
+
 free_client:
 	kfree(clt);
 error:

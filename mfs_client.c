@@ -101,7 +101,8 @@ err:
  */
 void mfs_client_close_session(struct mfs_client *clt)
 {
-	clt->ops->close(clt);
+	if(clt->ops)
+		clt->ops->close(clt);
 	client_close_socket(clt);
 }
 
