@@ -32,6 +32,7 @@
 enum mfs_imap_f_type {
 	MFS_IMAP_F_UNKNOWN,
 	MFS_IMAP_F_MAIL,
+	MFS_IMAP_F_BOX,
 };
 
 #define IMAPCMD_TAG(id, s) [id] = {					\
@@ -67,12 +68,12 @@ struct msgcache {
 	char body[];
 };
 
-struct msgdesc {
+struct filedesc {
 	enum mfs_imap_f_type ftype;
 };
 
 struct message {
-	struct msgdesc msgd;
+	struct filedesc msgd;
 	struct list_head box_next;
 	struct list_head cache_next;
 	struct list_head fetch_next;
@@ -83,13 +84,20 @@ struct message {
 	char name[];
 };
 
+#define	MFS_IMAP_B_NOSELECT	1
+#define	MFS_IMAP_B_HASCHILDREN	2
+
 struct box {
+	struct filedesc boxd;
 	struct list_head next;
 	struct list_head msg;
+	struct box *parent;
 	struct dentry *dir;
+	unsigned int type;
 	off_t uidlast;
 	off_t sidlast;
-	char name[];
+	char *name;
+	char path[];
 };
 
 static inline struct msgcache *imap_new_msgcache(char const *data)
@@ -194,17 +202,52 @@ void imap_cleanup_cmd(struct imap_cmd *c)
 	kref_put(&c->refcnt, imap_del_cmd);
 }
 
-static struct box * imap_create_box(char const *name)
+static struct box * imap_create_box(struct imap *i, char const *path,
+		struct imap_msg *attr)
 {
-	struct box *b = kmalloc(sizeof(*b) + strlen(name) + 1, GFP_KERNEL);
+	struct box *b, *p;
+	struct imap_elt *e;
+	unsigned int type = 0;
+	char const *end;
+
+	list_for_each_entry(e, &attr->elt, next) {
+		if(e->type != IET_ATOM)
+			continue;
+		if(strcmp(IMAP_ELT_ATOM(e), "\\Noselect") == 0)
+			type |= MFS_IMAP_B_NOSELECT;
+		else if(strcmp(IMAP_ELT_ATOM(e), "\\HasChildren") == 0)
+			type |= MFS_IMAP_B_HASCHILDREN;
+	}
+
+	b = kmalloc(sizeof(*b) + strlen(path) + 1, GFP_KERNEL);
 	if(b == NULL)
 		return NULL;
 
 	INIT_LIST_HEAD(&b->msg);
+	b->boxd.ftype = MFS_IMAP_F_BOX;
+	b->type = type;
 	b->uidlast = 0;
 	b->sidlast = 0;
+	b->parent = NULL;
+	b->name = b->path;
 
-	strcpy(b->name, name);
+	/**
+	 * Add mailbox parent
+	 */
+	end = strrchr(path, '/');
+	if(end != NULL) {
+		list_for_each_entry(p, &i->boxes, next) {
+			if((p->type & MFS_IMAP_B_HASCHILDREN) &&
+					(!strncmp(p->name, path, end - path)) &&
+					(p->name[end - path] == '\0')) {
+				b->parent = p;
+				break;
+			}
+		}
+		b->name = &b->path[end - path + 1];
+	}
+
+	strcpy(b->path, path);
 
 	return b;
 }
@@ -337,17 +380,21 @@ static int mfs_imap_wait_conn(struct imap *i)
 #define MFS_IMAP_ALLOC() mfs_imap_alloc(MSGCACHESZ)
 #define MFS_IMAP_FREE(i) mfs_imap_free(i)
 
-static int imap_add_box(struct mfs_client *clt, char const *name)
+static int imap_add_box(struct mfs_client *clt, char const *path,
+		struct imap_msg *attr)
 {
 	struct imap *i = (struct imap *)clt->private_data;
-	struct box *b = imap_create_box(name);
-	struct dentry *dir;
+	struct box *b;
+	struct dentry *dir, *parent = clt->sb->s_root;
 
+	b = imap_create_box(i, path, attr);
 	if(b == NULL)
 		return -1;
 
-	dir = mfs_inode_create_dir(clt->sb, clt->sb->s_root, b->name, b);
+	if(b->parent)
+		parent = b->parent->dir;
 
+	dir = mfs_inode_create_dir(clt->sb, parent, b->name, &b->boxd);
 	if(dir == NULL) {
 		imap_del_box(b);
 		return -1;
@@ -419,30 +466,50 @@ static int imap_rm_mail(struct mfs_client *clt, char const *name)
 static int imap_rcv_box(struct mfs_client *clt, struct imap_msg *m)
 {
 	struct imap *i = (struct imap *)clt->private_data;
+	struct imap_msg *attr = NULL;
 	struct imap_elt *e;
 	struct box *b;
+	char *path = NULL;
 	int ret;
 
-	e = list_last_entry(&m->elt, struct imap_elt, next);
-	if(e->type != IET_ATOM)
+	list_for_each_entry(e, &m->elt, next) {
+		if(e->type == IET_LIST) {
+			attr = IMAP_ELT_MSG(e);
+			break;
+		}
+	}
+
+	if(attr == NULL) {
 		IMAP_DBG("Wrong box list message\n");
+		return -1;
+	}
+
+	e = list_last_entry(&m->elt, struct imap_elt, next);
+	if(e->type == IET_STRING) {
+		path = IMAP_ELT_STR(e);
+	} else if(e->type == IET_ATOM) {
+		path = IMAP_ELT_ATOM(e);
+	} else {
+		IMAP_DBG("Wrong box list message\n");
+		return -1;
+	}
 
 	/**
 	 * If box already here, exit
 	 */
 	list_for_each_entry(b, &i->boxes, next) {
-		if(strcmp(b->name, IMAP_ELT_ATOM(e)) == 0) {
+		if(strcmp(b->path, path) == 0) {
 			IMAP_DBG("Box already created\n");
 			return 0;
 		}
 	}
 
-	ret = imap_add_box(clt, IMAP_ELT_ATOM(e));
+	ret = imap_add_box(clt, path, attr);
 	if(ret != 0) {
-		IMAP_DBG("Failed to create box %s\n", IMAP_ELT_ATOM(e));
-		return 0;
+		IMAP_DBG("Failed to create box %s\n", path);
+		return -1;
 	}
-	IMAP_DBG("Box %s created\n", IMAP_ELT_ATOM(e));
+	IMAP_DBG("Box %s created\n", path);
 
 	return 0;
 }
@@ -1183,7 +1250,7 @@ killthread:
 static ssize_t mfs_imap_read(struct mfs_client *clt, struct file *f,
 		void *pdata, char __user *buf, size_t size, loff_t off)
 {
-	struct msgdesc *md = (struct msgdesc *)pdata;
+	struct filedesc *fd = (struct filedesc *)pdata;
 	struct message *msg;
 	ssize_t ret = -EINVAL;
 	size_t len;
@@ -1191,9 +1258,9 @@ static ssize_t mfs_imap_read(struct mfs_client *clt, struct file *f,
 	/**
 	 * XXX Need to lock imap
 	 */
-	switch(md->ftype) {
+	switch(fd->ftype) {
 	case MFS_IMAP_F_MAIL:
-		msg = container_of(md, struct message, msgd);
+		msg = container_of(fd, struct message, msgd);
 
 		ret = imap_get_msg_body(clt, msg);
 		if(ret != 0)
@@ -1224,10 +1291,41 @@ static ssize_t mfs_imap_write(struct mfs_client *clt, struct file *f,
 	return -EINVAL;
 }
 
+static int mfs_imap_readdir(struct mfs_client *clt, struct file *f,
+		void *pdata, void *dirent, filldir_t filldir)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+	struct filedesc *fd = (struct filedesc *)pdata;
+	struct box *box;
+	ssize_t ret = -EINVAL;
+
+	/**
+	 * XXX Need to lock imap
+	 */
+	switch(fd->ftype) {
+	case MFS_IMAP_F_BOX:
+		box = container_of(fd, struct box, boxd);
+		if(box == i->selbox) {
+			ret = 0;
+			break;
+		}
+
+		IMAP_DBG("Change to Box %s\n", box->name);
+		ret = 0;
+		break;
+	default:
+		IMAP_DBG("Invalid imap file type");
+		break;
+	}
+
+	return ret;
+}
+
 struct mfs_client_operations imapops = {
 	.connect = mfs_imap_connect,
 	.close = mfs_imap_close,
 	.reconnect = mfs_imap_reconnect,
 	.read = mfs_imap_read,
 	.write = mfs_imap_write,
+	.readdir = mfs_imap_readdir,
 };

@@ -23,12 +23,12 @@
  */
 #define IS_CTL(c)	(((c) >= 0 && (c) <= 31) || (c) == 127)
 #define IS_LISTWC(c)	((c) == '%' || (c) == '*')
-#define IS_QUOTEDSPE(c)	((c) == '"' || (c) == '\\')
+#define IS_QUOTEDSPE(c)	((c) == '"')
 #define IS_RESPSPE(c)	((c) == ']')
 #define IS_CR(c)	((c) == '\r')
 #define IS_LF(c)	((c) == '\n')
 #define IS_WHITESPE(c)	((c) == ' ' || IS_CTL(c) || IS_LISTWC(c) ||	\
-	 IS_RESPSPE(c) || (c) == '\\')
+	 IS_RESPSPE(c))
 #define IS_NIL(s, l)							\
 	(((l) > strlen("NIL")) && (memcmp(s, "NIL", strlen("NIL")) == 0))
 

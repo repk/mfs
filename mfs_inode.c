@@ -59,10 +59,11 @@ struct dentry *mfs_inode_create_dir(struct super_block *sb,
 
 	inode = mfs_inode_make(sb, S_IFDIR | 0544);
 	if(inode == NULL)
-		goto err;
+		goto deldentry;
 
 	inode->i_op = &mfs_dir_inode_ops;
 	inode->i_fop = &mfs_dir_ops;
+	inode->i_private = data;
 
 	/**
 	 * Associate the file and its dentry
@@ -70,6 +71,9 @@ struct dentry *mfs_inode_create_dir(struct super_block *sb,
 	d_add(dentry, inode);
 
 	return dentry;
+
+deldentry:
+	dput(dentry);
 err:
 	return NULL;
 }

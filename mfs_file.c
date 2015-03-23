@@ -38,7 +38,7 @@ static ssize_t mfs_file_write(struct file *f, const char __user *buf,
 	return mfs_client_write(clt, f, buf, size);
 }
 
-struct file_operations mfs_file_ops = {
+struct file_operations const mfs_file_ops = {
 	.open = mfs_file_open,
 	.read = mfs_file_read,
 	.write = mfs_file_write,

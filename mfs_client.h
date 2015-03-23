@@ -24,6 +24,8 @@ struct mfs_client_operations {
 			char __user *buf, size_t size, loff_t off);
 	ssize_t (*write)(struct mfs_client *clt, struct file *f, void *pdata,
 			const char __user *buf, size_t size);
+	int (*readdir)(struct mfs_client *clt, struct file *f, void *pdata,
+			void *dirent, filldir_t filldir);
 };
 
 struct mfs_client *mfs_client_create(struct super_block *sb);
@@ -46,5 +48,7 @@ ssize_t mfs_client_kernel_net_send(struct mfs_client *clt, const char *buf,
 ssize_t mfs_client_write(struct mfs_client *clt, struct file *f,
 		const char __user *buf, size_t size);
 int mfs_client_kernel_wait_recv(struct mfs_client *clt, long timeout);
+int mfs_client_readdir(struct mfs_client *clt, struct file *f,
+		void *dirent, filldir_t filldir);
 
 #endif

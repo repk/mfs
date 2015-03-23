@@ -1,5 +1,6 @@
 SRC := mfs_imap_parse.c mfs_imap.c mfs_cmdqueue.c mfs_client.c		\
-       mfs_imap_send.c mfs_file.c mfs_inode.c mfs_super.c mfs_mod.c
+       mfs_imap_send.c mfs_dir.c mfs_file.c mfs_inode.c mfs_super.c	\
+       mfs_mod.c
 INC := mfs_imap_parse.h mfs_imap.h mfs_cmdqueue.h mfs_client.h		\
        mfs_imap_send.h mfs_file.h mfs_dir.h mfs_inode.h mfs_super.h
 TOOLSDIR := tools

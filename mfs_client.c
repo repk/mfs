@@ -269,7 +269,7 @@ ssize_t mfs_client_write(struct mfs_client *clt, struct file *f,
 {
 	struct inode *i = file_inode(f);
 
-	if(i->i_private != NULL)
+	if(i->i_private == NULL)
 		return mfs_client_net_send(clt, buf, size);
 
 	return clt->ops->write(clt, f, i->i_private, buf, size);
@@ -300,4 +300,15 @@ int mfs_client_kernel_wait_recv(struct mfs_client *clt, long timeout)
 	clt->cs->sk->sk_rcvtimeo = timeo_old;
 
 	return ret;
+}
+
+int mfs_client_readdir(struct mfs_client *clt, struct file *f,
+		void *dirent, filldir_t filldir)
+{
+	struct inode *i = file_inode(f);
+
+	if(i->i_private == NULL)
+		return -EINVAL;
+
+	return clt->ops->readdir(clt, f, i->i_private, dirent, filldir);
 }
