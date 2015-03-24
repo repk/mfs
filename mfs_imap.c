@@ -54,7 +54,7 @@ static struct imap_cmdfmt const cmdfmt[] = {
 	IMAPCMD_TAG(IMAPCMD_LOGIN, "LOGIN %s %s"),
 	IMAPCMD_TAG(IMAPCMD_LOGOUT, "LOGOUT"),
 	IMAPCMD_TAG(IMAPCMD_LIST, "LIST \"\" \"*\""),
-	IMAPCMD_TAG(IMAPCMD_SELECT, "SELECT %s"),
+	IMAPCMD_TAG(IMAPCMD_SELECT, "SELECT \"%s\""),
 	IMAPCMD_TAG(IMAPCMD_FETCHALL, "UID FETCH 1:* FLAGS"),
 	IMAPCMD_TAG(IMAPCMD_FETCHFROM, "UID FETCH %lu:* FLAGS"),
 	IMAPCMD_TAG(IMAPCMD_FETCHMAIL, "UID FETCH %lu BODY[]"),
@@ -617,7 +617,10 @@ static int imap_new_mail(struct mfs_client *clt, struct imap_msg *m)
 	struct imap_cmd *c;
 	int ret;
 
-	if(i->selbox == NULL)
+	/**
+	 * Asynchronous mail fetching only if imap is idling
+	 */
+	if((i->selbox == NULL) || (atomic_read(&i->idling) == 0))
 		return 0;
 
 	/**
@@ -998,24 +1001,18 @@ out:
 	return ret;
 }
 
-static inline int mfs_imap_select_inbox(struct mfs_client *clt)
+static inline int mfs_imap_select_box(struct mfs_client *clt, struct box *b)
 {
 	struct imap *i = (struct imap *)clt->private_data;
 	struct imap_cmd *c;
 	struct imap_elt *e;
 	struct imap_msg *r;
-	struct box *b;
+	struct box *box = i->selbox;
 	int ret;
 
-	list_for_each_entry(b, &i->boxes, next) {
-		if(strcmp("INBOX", b->name) == 0)
-			break;
-	}
+	i->selbox = NULL;
 
-	if(strcmp("INBOX", b->name) != 0)
-		return -EINVAL;
-
-	c = imap_create_cmd(i, IMAPCMD_SELECT, "INBOX");
+	c = imap_create_cmd(i, IMAPCMD_SELECT, b->path);
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
@@ -1037,15 +1034,33 @@ static inline int mfs_imap_select_inbox(struct mfs_client *clt)
 	mfs_imap_msg_put(r);
 
 	if(ret > 0 || ret < 0) {
-		IMAP_DBG("Failed to select inbox\n");
+		IMAP_DBG("Failed to select box %s\n", b->path);
 		return -EINVAL;
 	}
 
-	i->selbox = b;
-	IMAP_DBG("inbox selected\n");
+	box = b;
+	IMAP_DBG("Box %s selected\n", b->path);
 
 out:
+	i->selbox = box;
 	return ret;
+}
+
+static inline int mfs_imap_select_inbox(struct mfs_client *clt)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+	struct box *b;
+
+	list_for_each_entry(b, &i->boxes, next) {
+		if(strcmp("INBOX", b->name) == 0)
+			break;
+	}
+
+	if(strcmp("INBOX", b->name) != 0)
+		return -EINVAL;
+
+
+	return mfs_imap_select_box(clt, b);
 }
 
 static inline int mfs_imap_list_mail(struct mfs_client *clt)
@@ -1056,7 +1071,10 @@ static inline int mfs_imap_list_mail(struct mfs_client *clt)
 	struct imap_msg *r;
 	int ret;
 
-	c = imap_create_cmd(i, IMAPCMD_FETCHALL);
+	if(i->selbox == NULL)
+		return -EINVAL;
+
+	c = imap_create_cmd(i, IMAPCMD_FETCHFROM, i->selbox->uidlast + 1);
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
@@ -1305,13 +1323,16 @@ static int mfs_imap_readdir(struct mfs_client *clt, struct file *f,
 	switch(fd->ftype) {
 	case MFS_IMAP_F_BOX:
 		box = container_of(fd, struct box, boxd);
-		if(box == i->selbox) {
+		if((box == i->selbox) || (box->type & MFS_IMAP_B_NOSELECT)) {
 			ret = 0;
 			break;
 		}
 
 		IMAP_DBG("Change to Box %s\n", box->name);
-		ret = 0;
+		ret = mfs_imap_select_box(clt, box);
+		if(ret < 0)
+			break;
+		ret = mfs_imap_list_mail(clt);
 		break;
 	default:
 		IMAP_DBG("Invalid imap file type");
