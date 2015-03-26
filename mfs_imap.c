@@ -91,6 +91,7 @@ struct box {
 	struct filedesc boxd;
 	struct list_head next;
 	struct list_head msg;
+	struct list_head shrink;
 	struct box *parent;
 	struct dentry *dir;
 	unsigned int type;
@@ -224,6 +225,7 @@ static struct box * imap_create_box(struct imap *i, char const *path,
 		return NULL;
 
 	INIT_LIST_HEAD(&b->msg);
+	INIT_LIST_HEAD(&b->shrink);
 	b->boxd.ftype = MFS_IMAP_F_BOX;
 	b->type = type;
 	b->uidlast = 0;
@@ -535,6 +537,42 @@ static inline int imap_fetch_body(struct mfs_client *clt, char const *name,
 	return 0;
 }
 
+static inline void imap_keep_mail(struct mfs_client *clt, off_t uid)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+	struct box *b = i->selbox;
+	struct message *m;
+
+	if(b == NULL)
+		return;
+
+	list_for_each_entry(m, &b->shrink, box_next) {
+		if(m->uid == uid) {
+			list_move(&m->box_next, &b->msg);
+			break;
+		}
+	}
+}
+
+static inline void imap_prepare_shrink(struct mfs_client *clt)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+
+	list_splice_init(&i->selbox->msg, &i->selbox->shrink);
+}
+
+static inline void imap_shrink(struct mfs_client *clt)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+	struct message *m, *tmp;
+
+	list_for_each_entry_safe(m, tmp, &i->selbox->shrink, box_next) {
+		imap_rm_mail(clt, m->name);
+	}
+
+	INIT_LIST_HEAD(&i->selbox->shrink);
+}
+
 static int imap_rcv_mail(struct mfs_client *clt, struct imap_msg *m)
 {
 	struct imap *i = (struct imap *)clt->private_data;
@@ -592,6 +630,11 @@ static int imap_rcv_mail(struct mfs_client *clt, struct imap_msg *m)
 			IMAP_DBG("Failed to fetch message %s\n", name);
 			return 0;
 		}
+	} else if(!list_empty(&i->selbox->shrink)) {
+		/**
+		 * We are doing a box shrink here to resynchronize mail
+		 */
+		imap_keep_mail(clt, uid);
 	}
 
 	if(body) {
@@ -1063,7 +1106,7 @@ static inline int mfs_imap_select_inbox(struct mfs_client *clt)
 	return mfs_imap_select_box(clt, b);
 }
 
-static inline int mfs_imap_list_mail(struct mfs_client *clt)
+static inline int mfs_imap_sync_mail(struct mfs_client *clt)
 {
 	struct imap *i = (struct imap *)clt->private_data;
 	struct imap_cmd *c;
@@ -1074,7 +1117,9 @@ static inline int mfs_imap_list_mail(struct mfs_client *clt)
 	if(i->selbox == NULL)
 		return -EINVAL;
 
-	c = imap_create_cmd(i, IMAPCMD_FETCHFROM, i->selbox->uidlast + 1);
+	imap_prepare_shrink(clt);
+
+	c = imap_create_cmd(i, IMAPCMD_FETCHALL);
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
@@ -1103,6 +1148,7 @@ static inline int mfs_imap_list_mail(struct mfs_client *clt)
 	IMAP_DBG("Mail list fetched\n");
 
 out:
+	imap_shrink(clt);
 	return ret;
 }
 
@@ -1166,7 +1212,7 @@ static int mfs_imap_connect(struct mfs_client *clt, char *data)
 	if(ret < 0)
 		goto out;
 
-	ret = mfs_imap_list_mail(clt);
+	ret = mfs_imap_sync_mail(clt);
 	if(ret < 0)
 		goto out;
 
@@ -1205,7 +1251,7 @@ static int mfs_imap_reconnect(struct mfs_client *clt)
 	if(ret < 0)
 		return ret;
 
-	ret = mfs_imap_list_mail(clt);
+	ret = mfs_imap_sync_mail(clt);
 	if(ret < 0)
 		return ret;
 
@@ -1332,7 +1378,7 @@ static int mfs_imap_readdir(struct mfs_client *clt, struct file *f,
 		ret = mfs_imap_select_box(clt, box);
 		if(ret < 0)
 			break;
-		ret = mfs_imap_list_mail(clt);
+		ret = mfs_imap_sync_mail(clt);
 		break;
 	default:
 		IMAP_DBG("Invalid imap file type");

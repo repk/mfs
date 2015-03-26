@@ -53,6 +53,4 @@ TODO (not in order)
 	  address_space_operation to use buffer cache)
 	- Support mail deletion when doing a "rm" on it.
 	- Support concurrent file access (protect imap structure)
-	- Support mailbox shrink while offline (if some mails have been deleted
-	  without detecting them during idling)
 	- and so on ...
