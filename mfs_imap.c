@@ -57,13 +57,15 @@ static struct imap_cmdfmt const cmdfmt[] = {
 	IMAPCMD_TAG(IMAPCMD_SELECT, "SELECT \"%s\""),
 	IMAPCMD_TAG(IMAPCMD_FETCHALL, "UID FETCH 1:* FLAGS"),
 	IMAPCMD_TAG(IMAPCMD_FETCHFROM, "UID FETCH %lu:* FLAGS"),
-	IMAPCMD_TAG(IMAPCMD_FETCHMAIL, "UID FETCH %lu BODY[]"),
+	IMAPCMD_TAG(IMAPCMD_FETCHFULLMAIL, "UID FETCH %lu BODY[]"),
+	IMAPCMD_TAG(IMAPCMD_FETCHMAIL, "UID FETCH %lu BODY[]<%lld.%zu>"),
 	IMAPCONTCMD_TAG(IMAPCMD_IDLE, "IDLE"),
 	IMAPCMD_TAG(IMAPCMD_DONE, "DONE"),
 };
 
 struct msgcache {
 	struct message *m;
+	loff_t off;
 	size_t len;
 	char body[];
 };
@@ -101,7 +103,7 @@ struct box {
 	char path[];
 };
 
-static inline struct msgcache *imap_new_msgcache(char const *data)
+static inline struct msgcache *imap_new_msgcache(char const *data, loff_t off)
 {
 	struct msgcache *mc;
 
@@ -111,6 +113,7 @@ static inline struct msgcache *imap_new_msgcache(char const *data)
 
 	strcpy(mc->body, data);
 	mc->len = strlen(data);
+	mc->off = off;
 
 	return mc;
 }
@@ -517,7 +520,7 @@ static int imap_rcv_box(struct mfs_client *clt, struct imap_msg *m)
 }
 
 static inline int imap_fetch_body(struct mfs_client *clt, char const *name,
-		char const *data)
+		char const *data, loff_t off)
 {
 	struct imap *i = (struct imap *)clt->private_data;
 	struct message *m;
@@ -530,7 +533,7 @@ static inline int imap_fetch_body(struct mfs_client *clt, char const *name,
 	if(strcmp(m->name, name) != 0)
 		return -1;
 
-	m->mfetch = imap_new_msgcache(data);
+	m->mfetch = imap_new_msgcache(data, off);
 	if(m->mfetch == NULL)
 		return -1;
 
@@ -579,6 +582,7 @@ static int imap_rcv_mail(struct mfs_client *clt, struct imap_msg *m)
 	struct imap_elt *r = NULL, *p, *e;
 	char name[32];
 	int ret, uid_elt = 0, body = 0;
+	loff_t off;
 	off_t uid;
 
 	e = list_last_entry(&m->elt, struct imap_elt, next);
@@ -611,7 +615,8 @@ static int imap_rcv_mail(struct mfs_client *clt, struct imap_msg *m)
 			r = p;
 			break;
 		} else if((p->type == IET_ATOM) &&
-				(strcmp(IMAP_ELT_ATOM(p), "BODY[]") == 0)) {
+				(sscanf(IMAP_ELT_ATOM(p),
+					"BODY[]<%lld>", &off) == 1)) {
 			body = 1;
 		}
 	}
@@ -639,10 +644,10 @@ static int imap_rcv_mail(struct mfs_client *clt, struct imap_msg *m)
 
 	if(body) {
 		if(r == NULL || r->type != IET_STRING) {
-			IMAP_DBG("Malformed fetch message 2\n");
+			IMAP_DBG("Empty fetched message\n");
 			return 0;
 		}
-		ret = imap_fetch_body(clt, name, IMAP_ELT_STR(r));
+		ret = imap_fetch_body(clt, name, IMAP_ELT_STR(r), off);
 		if(ret != 0) {
 			IMAP_DBG("Cannot fetch body for message %s\n", name);
 			return 0;
@@ -918,7 +923,17 @@ static int imap_receive(void *data)
 	return 0;
 }
 
-static int imap_get_msg_body(struct mfs_client *clt, struct message *msg)
+static inline void imap_prepare_msg_fetch(struct mfs_client *clt,
+		struct message *msg)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+
+	/** TODO BUG if msg->mfetch != NULL; */
+	list_add_tail(&msg->fetch_next, &i->fetching);
+}
+
+static int imap_get_msg_body(struct mfs_client *clt, struct message *msg,
+		loff_t offset, size_t len)
 {
 	struct imap_cmd *c;
 	struct imap_msg *r;
@@ -926,11 +941,11 @@ static int imap_get_msg_body(struct mfs_client *clt, struct message *msg)
 	struct imap *i = (struct imap *)clt->private_data;
 	int ret;
 
-	c = imap_create_cmd(i, IMAPCMD_FETCHMAIL, msg->uid);
+	c = imap_create_cmd(i, IMAPCMD_FETCHMAIL, msg->uid, offset, len);
 	if(IS_ERR(c))
 		return PTR_ERR(c);
 
-	list_add_tail(&msg->fetch_next, &i->fetching);
+	imap_prepare_msg_fetch(clt, msg);
 
 	ret = mfs_imap_send_cmd(clt, c, &r);
 
@@ -963,6 +978,7 @@ out:
 static int imap_put_msg_body(struct message *msg)
 {
 	imap_del_msgcache(msg->mfetch);
+	msg->mfetch = NULL;
 	return 0;
 }
 
@@ -1326,17 +1342,18 @@ static ssize_t mfs_imap_read(struct mfs_client *clt, struct file *f,
 	case MFS_IMAP_F_MAIL:
 		msg = container_of(fd, struct message, msgd);
 
-		ret = imap_get_msg_body(clt, msg);
-		if(ret != 0)
+		ret = imap_get_msg_body(clt, msg, off, size);
+		if((ret != 0) || (msg->mfetch == NULL))
 			break;
 
-		if(off >= msg->mfetch->len) {
+		if(off != msg->mfetch->off) {
 			ret = 0;
+			imap_put_msg_body(msg);
 			break;
 		}
 
-		len = min(size, (size_t)(msg->mfetch->len - off));
-		ret = copy_to_user(buf, msg->mfetch->body + off, len);
+		len = min(size, msg->mfetch->len);
+		ret = copy_to_user(buf, msg->mfetch->body, len);
 		if(ret == 0)
 			ret = len;
 		imap_put_msg_body(msg);
