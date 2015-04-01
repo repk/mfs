@@ -28,4 +28,9 @@ int mfs_imap_send_cmd(struct mfs_client *clt, struct imap_cmd *send,
  */
 int mfs_imap_send_process(void *data);
 
+/**
+ * This relaunch imap idle
+ */
+int mfs_imap_send_rsp(struct mfs_client *clt);
+
 #endif

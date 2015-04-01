@@ -347,6 +347,7 @@ static inline struct imap *mfs_imap_alloc(ssize_t mcachesz)
 		init_waitqueue_head(&i->rcvwait);
 		init_waitqueue_head(&i->idlwait);
 		init_waitqueue_head(&i->conwait);
+		init_waitqueue_head(&i->sndwait);
 		mfs_cmdqueue_init(&i->send);
 		INIT_LIST_HEAD(&i->boxes);
 		INIT_LIST_HEAD(&i->fetching);
@@ -786,6 +787,11 @@ static inline int imap_process_msg(struct mfs_client *clt, struct imap_msg *msg)
 			wake_up_interruptible(&r->qwait);
 		}
 	} else if((e->type == IET_NUMBER) && (*IMAP_ELT_NUM(e) < NRTAG)) {
+		/**
+		 * Message received from server get back to idle state
+		 */
+		mfs_imap_send_rsp(clt);
+
 		tagid = *IMAP_ELT_NUM(e);
 		r = &i->rcv_handle[tagid];
 		if(atomic_xchg(&r->ready, 0) == 1) {

@@ -60,6 +60,7 @@ struct imap {
 	wait_queue_head_t rcvwait;
 	wait_queue_head_t idlwait;
 	wait_queue_head_t conwait;
+	wait_queue_head_t sndwait;
 	struct imap_opt opt;
 	size_t mcachesz;
 	atomic_t next_tag;
@@ -73,6 +74,7 @@ struct imap {
 #define IMAP_AUTH (1 << 1)
 #define IMAP_INIT (1 << 2)
 #define IMAP_EXIT (1 << 3)
+#define IMAP_CMD  (1 << 4)
 
 
 extern struct mfs_client_operations imapops;

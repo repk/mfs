@@ -323,6 +323,15 @@ out:
 	return ret;
 }
 
+static inline int imap_send_wait_rsp(struct mfs_client *clt)
+{
+	struct imap *i = (struct imap *)clt->private_data;
+
+	i->flags |= IMAP_CMD;
+	return wait_event_interruptible_timeout(i->sndwait,
+			(i->flags & IMAP_CMD) == 0, IMAP_TIMEOUT);
+}
+
 #define IMAP_RECO_WAIT 2000 /* 2 sec */
 
 /**
@@ -440,12 +449,24 @@ int mfs_imap_send_process(void *data)
 			imap_unidle(clt);
 
 			_imap_send_cmd(clt, c);
+			imap_send_wait_rsp(clt);
 			list_del(&c->next);
 			imap_cleanup_cmd(c);
-
 			imap_idle(clt);
 		}
 	}
 
+	return 0;
+}
+
+/**
+ * To be used when command has been answered
+ */
+int mfs_imap_send_rsp(struct mfs_client *clt)
+{
+	struct imap *i = (struct imap*)clt->private_data;
+
+	i->flags &= ~IMAP_CMD;
+	wake_up_interruptible(&i->sndwait);
 	return 0;
 }
