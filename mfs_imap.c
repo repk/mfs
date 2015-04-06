@@ -24,7 +24,8 @@
 /**
  * Keep enough space for 3 digits tag
  */
-#define ITAG "## "
+#define _ITAG "##"
+#define ITAG _ITAG" "
 
 #define MSGCACHESZ 128
 #define BODYMAXLEN (1 << 16)
@@ -799,10 +800,17 @@ static inline int imap_process_msg(struct mfs_client *clt, struct imap_msg *msg)
 				*(r->rcv) = msg;
 			IMAP_DBG("Rcv tagid %u for msg %p\n", tagid, msg);
 			/**
-			 * Wake up process that is waiting for a response
+			 * A process is waiting for synchronous response so
+			 * wake it up
 			 */
 			wake_up_interruptible(&r->qwait);
 		}
+	} else if((e->type == IET_ATOM) &&
+			(strcmp(IMAP_ELT_ATOM(e), _ITAG) == 0)) {
+		/**
+		 * Message received from server get back to idle state
+		 */
+		mfs_imap_send_rsp(clt);
 	}
 
 	/**
@@ -1276,6 +1284,10 @@ static int mfs_imap_reconnect(struct mfs_client *clt)
 	ret = mfs_imap_sync_mail(clt);
 	if(ret < 0)
 		return ret;
+
+	atomic_xchg(&i->idling, 0);
+	wake_up_interruptible(&i->idlwait);
+
 
 	i->flags &= ~IMAP_INIT;
 
