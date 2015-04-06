@@ -52,6 +52,7 @@ struct imap_parse_ctx {
 	struct imap_msg *msg;
 	struct imap_elt *elt;
 	size_t more;
+	int cr;
 };
 
 /**

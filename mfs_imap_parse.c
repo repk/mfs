@@ -27,14 +27,13 @@
 #define IS_RESPSPE(c)	((c) == ']')
 #define IS_CR(c)	((c) == '\r')
 #define IS_LF(c)	((c) == '\n')
-#define IS_WHITESPE(c)	((c) == ' ' || IS_CTL(c) || IS_LISTWC(c) ||	\
-	 IS_RESPSPE(c))
+#define IS_WHITESPE(c)	((c) == ' ' || IS_CTL(c) || IS_RESPSPE(c))
 #define IS_NIL(s, l)							\
 	(((l) > strlen("NIL")) && (memcmp(s, "NIL", strlen("NIL")) == 0))
 
 #define IS_ATOMSPE(c)							\
 	((c) == '(' || (c) == ')' || (c) == '{' || (c) == ' ' ||	\
-	 IS_CTL(c)|| IS_LISTWC(c) || IS_QUOTEDSPE(c))
+	 IS_CTL(c)|| IS_QUOTEDSPE(c))
 
 
 
@@ -192,6 +191,37 @@ static inline struct imap_elt *mfs_imap_parse_number(struct imap_parse_ctx *c,
 	*ptr = nb;
 
 out:
+	if(*len == 0) {
+		c->elt = new;
+		new = NULL;
+	}
+
+	return new;
+}
+
+static inline
+struct imap_elt *mfs_imap_parse_number_cont(struct imap_parse_ctx *c,
+		char const **p, size_t *len)
+{
+	struct imap_elt *new = c->elt;
+	int nb = *IMAP_ELT_NUM(new), *ptr;
+
+
+	while(*len != 0 && isdigit(**p)) {
+		nb = nb * 10 + **p - '0';
+		++(*p);
+		--(*len);
+	}
+	IMAP_DBG("NUMBER - CONT %u\n", nb);
+
+	ptr = IMAP_ELT_NUM(new);
+	*ptr = nb;
+
+	if(*len == 0) {
+		c->elt = new;
+		new = NULL;
+	}
+
 	return new;
 }
 
@@ -422,6 +452,14 @@ out:
 	return new;
 }
 
+static inline void mfs_imap_skip_atomspe(struct imap_parse_ctx *c,
+		char const **p, size_t *len)
+{
+	pr_err("[MFS/IMAP_PARSE]: %c is not supported\n", (*p)[0]);
+	++(*p);
+	--(*len);
+}
+
 static inline void mfs_imap_parse_reset_ctx(struct imap_parse_ctx *c)
 {
 	INIT_ISTACK(&c->st);
@@ -429,6 +467,7 @@ static inline void mfs_imap_parse_reset_ctx(struct imap_parse_ctx *c)
 	c->msg = NULL;
 	c->elt = NULL;
 	c->more = 0;
+	c->cr = 0;
 }
 
 static inline struct imap_elt *mfs_imap_parse_cont(struct imap_parse_ctx *c,
@@ -452,8 +491,7 @@ static inline struct imap_elt *mfs_imap_parse_cont(struct imap_parse_ctx *c,
 	case IET_NIL:
 	case IET_LIST:
 	case IET_NUMBER:
-		IMAP_DBG("Not implemented yet sorry\n");
-		mfs_imap_parse_reset_ctx(c);
+		ret = mfs_imap_parse_number_cont(c, p, len);
 		break;
 	default:
 		IMAP_DBG("Wrong elt type\n");
@@ -463,26 +501,29 @@ static inline struct imap_elt *mfs_imap_parse_cont(struct imap_parse_ctx *c,
 	return ret;
 }
 
-static inline int mfs_imap_parse_end(char const **msg, size_t *len)
+static inline int mfs_imap_parse_end(struct imap_parse_ctx *c,
+		char const **msg, size_t *len)
 {
 	char const *p = *msg;
 	char const *end = p + *len;
 	size_t l = *len;
-	int cr = 0, lf = 0;
+	int lf = 0;
 
 	/**
 	 * Skip aditional whitespaces
 	 */
-	while((p < end) && (IS_WHITESPE(*p)) && (cr == 0 || lf == 0)) {
+	while((p < end) && (IS_WHITESPE(*p)) && (c->cr == 0 || lf == 0)) {
 		/**
 		 * CRLF is new message so finish this message
 		 */
-		if(cr == 1 && IS_LF(*p))
+		if(c->cr == 1 && IS_LF(*p)) {
 			lf = 1;
-		else if(IS_CR(*p))
-			cr = 1;
-		else if(cr == 1)
-			cr = 0;
+			c->cr = 0;
+		} else if(IS_CR(*p)) {
+			c->cr = 1;
+		} else if(c->cr == 1) {
+			c->cr = 0;
+		}
 
 		++p;
 		--l;
@@ -491,7 +532,10 @@ static inline int mfs_imap_parse_end(char const **msg, size_t *len)
 	*msg = p;
 	*len = l;
 
-	return (cr == 1 && lf == 1);
+	if(l)
+		c->cr = 0;
+
+	return lf == 1;
 }
 
 /**
@@ -510,6 +554,7 @@ struct imap_parse_ctx *mfs_imap_parse_new_ctx(void)
 	ctx->msg = NULL;
 	ctx->elt = NULL;
 	ctx->more = 0;
+	ctx->cr = 0;
 
 	return ctx;
 }
@@ -519,6 +564,9 @@ struct imap_parse_ctx *mfs_imap_parse_new_ctx(void)
  */
 void mfs_imap_parse_del_ctx(struct imap_parse_ctx *ctx)
 {
+	if(ctx->first)
+		mfs_imap_msg_put(ctx->first);
+
 	kfree(ctx);
 }
 
@@ -534,16 +582,6 @@ struct imap_msg *mfs_imap_parse_msg(struct imap_parse_ctx *ctx,
 	size_t l = *len;
 	int msgend = 0;
 
-	/**
-	 * CRLF is empty message so finish here
-	 */
-	if((first == NULL) &&
-			((l == 0) || (IS_CR(p[0]) && (l == 1 || IS_LF(p[1]))))) {
-		l -= min(l, 2UL);
-		p += min(l, 2UL);
-		goto out;
-	}
-
 	if(im == NULL)
 		im = mfs_imap_msg_new();
 
@@ -555,15 +593,17 @@ struct imap_msg *mfs_imap_parse_msg(struct imap_parse_ctx *ctx,
 	 */
 	if(first == NULL) {
 		first = im;
-	} else {
-		new = mfs_imap_parse_cont(ctx, &p, &l);
-
-		msgend = mfs_imap_parse_end(&p, &l);
-
-		if(new != NULL)
-			list_add_tail(&new->next, &im->elt);
 	}
 
+	if(ctx->elt) {
+		new = mfs_imap_parse_cont(ctx, &p, &l);
+		if(new != NULL) {
+			list_add_tail(&new->next, &im->elt);
+			ctx->elt = NULL;
+		}
+	}
+
+	msgend = mfs_imap_parse_end(ctx, &p, &l);
 
 	while(p < end && !msgend) {
 		new = NULL;
@@ -572,18 +612,20 @@ struct imap_msg *mfs_imap_parse_msg(struct imap_parse_ctx *ctx,
 			new = mfs_imap_parse_number(ctx, &p, &l);
 		else if(p[0] == '(')
 			IMAP_BEGIN_LIST(ctx, im, &p, &l);
-		else if (p[0] == ')')
+		else if(p[0] == ')')
 			IMAP_END_LIST(ctx, im, &p, &l);
-		else if (p[0] == '"')
+		else if(p[0] == '"')
 			new = mfs_imap_parse_string(ctx, &p, &l);
-		else if (p[0] == '{')
+		else if(p[0] == '{')
 			new = mfs_imap_parse_literal(ctx, &p, &l);
-		else if (IS_NIL(p, l))
+		else if(IS_NIL(p, l))
 			new = mfs_imap_parse_nil(ctx, &p, &l);
+		else if(IS_ATOMSPE(p[0]))
+			mfs_imap_skip_atomspe(ctx, &p, &l);
 		else
 			new = mfs_imap_parse_atom(ctx, &p, &l);
 
-		msgend = mfs_imap_parse_end(&p, &l);
+		msgend = mfs_imap_parse_end(ctx, &p, &l);
 
 		/**
 		 * Append new imap element
