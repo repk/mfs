@@ -57,7 +57,7 @@ struct dentry *mfs_inode_create_dir(struct super_block *sb,
 	if(dentry == NULL)
 		goto err;
 
-	inode = mfs_inode_make(sb, S_IFDIR | 0544);
+	inode = mfs_inode_make(sb, S_IFDIR | 0555);
 	if(inode == NULL)
 		goto deldentry;
 
